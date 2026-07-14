@@ -485,7 +485,7 @@ def _get_inner1_config(index_len):
 
 
 def _get_inner1_membership_mask_config(outer_size, dim_size):
-    block_n = min(1024, triton.next_power_of_2(dim_size))
+    block_n = min(4096, triton.next_power_of_2(dim_size))
     n_tiles = triton.cdiv(dim_size, block_n)
     outer_blocks = max(1, triton.cdiv(32, n_tiles))
     block_p = min(512, triton.next_power_of_2(triton.cdiv(outer_size, outer_blocks)))
