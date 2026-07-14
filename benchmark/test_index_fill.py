@@ -41,8 +41,9 @@ class IndexFillBenchmark(base.GenericBenchmark):
 
     def get_latency(self, op, *args, **kwargs):
         if base.Config.mode == consts.BenchMode.OPERATOR:
-            # Keep one-time Triton loading out of the adaptive iteration count.
-            op(*self._clone_inplace_args(args), **kwargs)
+            # Keep lazy module loading out of the five-call adaptive estimate.
+            for _ in range(5):
+                op(*self._clone_inplace_args(args), **kwargs)
             base.torch_device_fn.synchronize()
         return super().get_latency(op, *self._clone_inplace_args(args), **kwargs)
 
