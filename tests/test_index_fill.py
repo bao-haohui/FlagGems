@@ -201,6 +201,56 @@ def test_index_fill_contiguous_inner3_fast_path(dtype):
     utils.gems_assert_equal(inplace, ref_out)
 
 
+@pytest.mark.index_fill
+@pytest.mark.parametrize("value_is_tensor", [False, True])
+def test_index_fill_large_contiguous_membership_functional(value_is_tensor):
+    inp = _make_input((1024, 1024), torch.float16)
+    index = torch.arange(16, dtype=torch.long, device=flag_gems.device)
+    value = (
+        torch.tensor(-3.5, dtype=inp.dtype, device=flag_gems.device)
+        if value_is_tensor
+        else -3.5
+    )
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_value = _to_ref_value(value)
+    ref_out = ref_inp.index_fill(1, ref_index, ref_value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+
+    assert actual is not inp
+    utils.gems_assert_equal(actual, ref_out)
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+def test_index_fill_large_contiguous_membership_duplicate_index():
+    inp = _make_input((1024, 1024), torch.float16)
+    base_index = torch.arange(127, dtype=torch.long, device=flag_gems.device)
+    index = torch.cat(
+        (
+            base_index,
+            base_index,
+            torch.tensor([-1], dtype=torch.long, device=flag_gems.device),
+        )
+    )
+    value = -3.5
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_out = ref_inp.index_fill(1, ref_index, value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+        inplace = inp.clone()
+        inplace.index_fill_(1, index, value)
+
+    utils.gems_assert_equal(actual, ref_out)
+    utils.gems_assert_equal(inplace, ref_out)
+
+
+
 @pytest.mark.index_fill_out
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)
 def test_index_fill_scalar_out(dtype):
