@@ -596,6 +596,65 @@ class IndexFillFusedKernel {
   bool inplace_;
 };
 
+template <typename T>
+__aicore__ inline void RunIndexFill(GM_ADDR input,
+                                    GM_ADDR index,
+                                    GM_ADDR output,
+                                    GM_ADDR membership,
+                                    float value,
+                                    uint32_t value_bits,
+                                    uint32_t rows,
+                                    uint32_t cols,
+                                    uint32_t index_count,
+                                    uint32_t dim,
+                                    uint32_t inplace,
+                                    uint32_t path_code,
+                                    uint32_t block_count) {
+  if (path_code == kDim0FunctionalSmallDirectPath ||
+      path_code == kDim0FunctionalSmallMembershipPath) {
+    IndexFillDim0FunctionalSmallKernel<T> kernel;
+    kernel.Init(input,
+                index,
+                output,
+                value,
+                value_bits,
+                rows,
+                cols,
+                index_count,
+                block_count,
+                path_code == kDim0FunctionalSmallDirectPath);
+    kernel.Process();
+    return;
+  }
+  if (path_code != kGeneralPath) {
+    IndexFillDim0InplaceSmallKernel<T> kernel;
+    kernel.Init(index,
+                output,
+                value,
+                value_bits,
+                rows,
+                cols,
+                index_count,
+                block_count,
+                path_code == kDim0InplaceSmallDeduplicatePath);
+    kernel.Process();
+    return;
+  }
+  IndexFillFusedKernel<T> kernel;
+  kernel.Init(input,
+              index,
+              output,
+              membership,
+              value,
+              value_bits,
+              rows,
+              cols,
+              index_count,
+              dim,
+              inplace);
+  kernel.Process();
+}
+
 }  // namespace
 
 extern "C" __global__ __aicore__ void flag_gems_index_fill_fused_2d(GM_ADDR input,
@@ -614,103 +673,13 @@ extern "C" __global__ __aicore__ void flag_gems_index_fill_fused_2d(GM_ADDR inpu
                                                                     uint32_t block_count) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
   if (dtype_code == 0) {
-    if (path_code == kDim0FunctionalSmallDirectPath || path_code == kDim0FunctionalSmallMembershipPath) {
-      IndexFillDim0FunctionalSmallKernel<half> kernel;
-      kernel.Init(input,
-                  index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0FunctionalSmallDirectPath);
-      kernel.Process();
-      return;
-    }
-    if (path_code != kGeneralPath) {
-      IndexFillDim0InplaceSmallKernel<half> kernel;
-      kernel.Init(index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0InplaceSmallDeduplicatePath);
-      kernel.Process();
-      return;
-    }
-    IndexFillFusedKernel<half> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
-    kernel.Process();
+    RunIndexFill<half>(input, index, output, membership, value, value_bits, rows,
+                       cols, index_count, dim, inplace, path_code, block_count);
   } else if (dtype_code == 1) {
-    if (path_code == kDim0FunctionalSmallDirectPath || path_code == kDim0FunctionalSmallMembershipPath) {
-      IndexFillDim0FunctionalSmallKernel<bfloat16_t> kernel;
-      kernel.Init(input,
-                  index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0FunctionalSmallDirectPath);
-      kernel.Process();
-      return;
-    }
-    if (path_code != kGeneralPath) {
-      IndexFillDim0InplaceSmallKernel<bfloat16_t> kernel;
-      kernel.Init(index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0InplaceSmallDeduplicatePath);
-      kernel.Process();
-      return;
-    }
-    IndexFillFusedKernel<bfloat16_t> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
-    kernel.Process();
-  } else {
-    if (path_code == kDim0FunctionalSmallDirectPath || path_code == kDim0FunctionalSmallMembershipPath) {
-      IndexFillDim0FunctionalSmallKernel<float> kernel;
-      kernel.Init(input,
-                  index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0FunctionalSmallDirectPath);
-      kernel.Process();
-      return;
-    }
-    if (path_code != kGeneralPath) {
-      IndexFillDim0InplaceSmallKernel<float> kernel;
-      kernel.Init(index,
-                  output,
-                  value,
-                  value_bits,
-                  rows,
-                  cols,
-                  index_count,
-                  block_count,
-                  path_code == kDim0InplaceSmallDeduplicatePath);
-      kernel.Process();
-      return;
-    }
-    IndexFillFusedKernel<float> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
-    kernel.Process();
+    RunIndexFill<bfloat16_t>(input, index, output, membership, value, value_bits,
+                             rows, cols, index_count, dim, inplace, path_code, block_count);
+  } else if (dtype_code == 2) {
+    RunIndexFill<float>(input, index, output, membership, value, value_bits, rows,
+                        cols, index_count, dim, inplace, path_code, block_count);
   }
 }
