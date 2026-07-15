@@ -243,6 +243,28 @@ def counted_impl(*args, **kwargs):
     return original_impl(*args, **kwargs)
 
 index_fill_module._index_fill_impl = counted_impl
+probe_inp = torch.arange(48, dtype=torch.float32, device=flag_gems.device).reshape(3, 16)
+probe_index = torch.arange(16, dtype=torch.long, device=flag_gems.device)[::2]
+plan = index_fill_module._select_cpp_index_fill_plan(
+    probe_inp,
+    1,
+    probe_index,
+    -7.0,
+    mode=index_fill_module.INDEX_FILL_FUNCTIONAL,
+    prepared=False,
+)
+expected_implementation = (
+    index_fill_module.INDEX_FILL_CUDA_CPP
+    if {launcher_enabled!r}
+    else index_fill_module.INDEX_FILL_TRITON
+)
+assert plan == index_fill_module.IndexFillPlan(
+    backend="cuda",
+    implementation=expected_implementation,
+    mode=index_fill_module.INDEX_FILL_FUNCTIONAL,
+    validation="device",
+)
+
 for value_is_tensor in (False, True):
     for inplace in (False, True):
         inp = torch.arange(48, dtype=torch.float32, device=flag_gems.device).reshape(3, 16)
@@ -401,6 +423,32 @@ def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
         )
     )
     value = -3.5
+    functional_plan = index_fill_module._select_ascendc_index_fill_plan(
+        inp,
+        1,
+        index,
+        value,
+        mode=index_fill_module.INDEX_FILL_FUNCTIONAL,
+    )
+    inplace_plan = index_fill_module._select_ascendc_index_fill_plan(
+        inp,
+        1,
+        index,
+        value,
+        mode=index_fill_module.INDEX_FILL_INPLACE,
+    )
+    assert functional_plan == index_fill_module.IndexFillPlan(
+        backend="npu",
+        implementation=index_fill_module.INDEX_FILL_ASCENDC,
+        mode=index_fill_module.INDEX_FILL_FUNCTIONAL,
+        validation="device",
+    )
+    assert inplace_plan == index_fill_module.IndexFillPlan(
+        backend="npu",
+        implementation=index_fill_module.INDEX_FILL_ASCENDC,
+        mode=index_fill_module.INDEX_FILL_INPLACE,
+        validation="device",
+    )
     ref_inp = utils.to_reference(inp, False)
     ref_index = utils.to_reference(index, False)
     expected = ref_inp.index_fill(1, ref_index, value)
@@ -553,6 +601,20 @@ def test_index_fill_ascendc_fallback_paths(monkeypatch, case, inplace):
         torch.tensor(-3.5, dtype=inp.dtype, device=flag_gems.device)
         if case == "tensor_value"
         else _scalar_value(inp.dtype)
+    )
+    mode = (
+        index_fill_module.INDEX_FILL_INPLACE
+        if inplace
+        else index_fill_module.INDEX_FILL_FUNCTIONAL
+    )
+    plan = index_fill_module._select_ascendc_index_fill_plan(
+        inp, dim, index, value, mode=mode
+    )
+    assert plan == index_fill_module.IndexFillPlan(
+        backend="npu",
+        implementation=index_fill_module.INDEX_FILL_TRITON,
+        mode=mode,
+        validation="device",
     )
     ref_inp = utils.to_reference(inp, False)
     ref_index = utils.to_reference(index, False)

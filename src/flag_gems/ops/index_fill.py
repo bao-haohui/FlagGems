@@ -4,6 +4,7 @@ import importlib.machinery
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Tuple
 
 import torch
@@ -51,6 +52,21 @@ def _get_cpp_index_fill_scalar():
 _CPP_INDEX_FILL_ENABLED = os.environ.get(
     "FLAG_GEMS_INDEX_FILL_CPP_LAUNCHER", "1"
 ).lower() not in ("", "0", "false", "off", "none", "disable", "disabled")
+
+INDEX_FILL_TRITON = "triton"
+INDEX_FILL_CUDA_CPP = "cuda_cpp"
+INDEX_FILL_ASCENDC = "ascendc"
+INDEX_FILL_FUNCTIONAL = "functional"
+INDEX_FILL_INPLACE = "inplace"
+INDEX_FILL_OUT = "out"
+
+
+@dataclass(frozen=True)
+class IndexFillPlan:
+    backend: str
+    implementation: str
+    mode: str
+    validation: str
 
 
 # libtriton_jit builds ASTSource directly and otherwise loses JITFunction.debug.
@@ -128,9 +144,9 @@ def _cpp_index_fill_enabled():
     return _CPP_INDEX_FILL_ENABLED
 
 
-def _index_fill_uses_device_bounds_check():
+def _index_fill_bounds_policy():
     mode = os.environ.get("FLAG_GEMS_INDEX_FILL_BOUNDS_CHECK", "device").lower()
-    return mode in (
+    if mode in (
         "",
         "0",
         "false",
@@ -141,7 +157,15 @@ def _index_fill_uses_device_bounds_check():
         "none",
         "disable",
         "disabled",
-    )
+    ):
+        return "device"
+    if mode in ("sync", "1", "true", "on"):
+        return "sync"
+    return mode
+
+
+def _index_fill_uses_device_bounds_check():
+    return _index_fill_bounds_policy() == "device"
 
 
 def _is_supported_cpp_scalar(value):
@@ -174,45 +198,143 @@ def _should_skip_cpp_index_fill_out(out, dim):
     return inner_size <= 4 and outer_size > 1 and dim_size > 8192
 
 
-def _try_cpp_index_fill_scalar_(out, dim, index, value):
-    if (
-        not _cpp_index_fill_enabled()
-        or not _should_use_cpp_index_fill(out, dim, index, value)
-    ):
+def _launcher_available(launcher_available):
+    if callable(launcher_available):
+        return launcher_available() is not None
+    return bool(launcher_available)
+
+
+def select_index_fill_plan(
+    inp,
+    dim,
+    index,
+    value,
+    *,
+    backend=None,
+    mode,
+    prepared=True,
+    launcher_enabled=False,
+    launcher_available=False,
+    is_ascend_910b=False,
+):
+    if mode not in (INDEX_FILL_FUNCTIONAL, INDEX_FILL_INPLACE, INDEX_FILL_OUT):
+        raise ValueError(f"Unsupported index_fill mode: {mode}")
+
+    backend = backend or inp.device.type
+    validation = _index_fill_bounds_policy()
+    fallback = IndexFillPlan(
+        backend=backend,
+        implementation=INDEX_FILL_TRITON,
+        mode=mode,
+        validation=validation,
+    )
+    if not launcher_enabled or not _is_supported_cpp_scalar(value):
+        return fallback
+
+    if backend == "npu":
+        if (
+            prepared
+            and mode in (INDEX_FILL_FUNCTIONAL, INDEX_FILL_INPLACE)
+            and is_ascend_910b
+            and inp.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and inp.ndim == 2
+            and inp.shape[0] > 0
+            and inp.shape[1] > 0
+            and inp.numel() <= (1 << 32) - 1
+            and dim in (0, 1)
+            and inp.shape[dim] <= 4096
+            and index.dtype == torch.long
+            and 8 <= index.numel() <= 4096
+            and index.numel() % 8 == 0
+            and inp.is_contiguous()
+            and index.is_contiguous()
+            and _launcher_available(launcher_available)
+        ):
+            return IndexFillPlan(
+                backend=backend,
+                implementation=INDEX_FILL_ASCENDC,
+                mode=mode,
+                validation=validation,
+            )
+        return fallback
+
+    if not prepared:
+        use_cpp = (
+            mode in (INDEX_FILL_FUNCTIONAL, INDEX_FILL_INPLACE)
+            and validation == "device"
+            and inp.is_contiguous()
+        )
+    else:
+        use_cpp = _should_use_cpp_index_fill(inp, dim, index, value)
+        if mode in (INDEX_FILL_FUNCTIONAL, INDEX_FILL_OUT):
+            use_cpp = use_cpp and not _should_skip_cpp_index_fill_out(inp, dim)
+
+    if use_cpp and _launcher_available(launcher_available):
+        return IndexFillPlan(
+            backend=backend,
+            implementation=INDEX_FILL_CUDA_CPP,
+            mode=mode,
+            validation=validation,
+        )
+    return fallback
+
+
+def _select_cpp_index_fill_plan(inp, dim, index, value, *, mode, prepared):
+    launcher = (
+        _get_cpp_index_fill_scalar_inplace
+        if prepared or mode in (INDEX_FILL_INPLACE, INDEX_FILL_OUT)
+        else _get_cpp_index_fill_scalar
+    )
+    return select_index_fill_plan(
+        inp,
+        dim,
+        index,
+        value,
+        backend=inp.device.type,
+        mode=mode,
+        prepared=prepared,
+        launcher_enabled=_cpp_index_fill_enabled(),
+        launcher_available=launcher,
+    )
+
+
+def _try_cpp_index_fill_scalar_(out, dim, index, value, *, mode):
+    plan = _select_cpp_index_fill_plan(out, dim, index, value, mode=mode, prepared=True)
+    if plan.implementation != INDEX_FILL_CUDA_CPP:
         return None
     cpp_func = _get_cpp_index_fill_scalar_inplace()
-    if cpp_func is None:
-        return None
     return cpp_func(out, dim, index, value)
 
 
 def _try_cpp_index_fill_scalar_fast(inp, dim, index, value):
-    if (
-        not _CPP_INDEX_FILL_ENABLED
-        or not _index_fill_uses_device_bounds_check()
-        or not _is_supported_cpp_scalar(value)
-        or not inp.is_contiguous()
-    ):
+    plan = _select_cpp_index_fill_plan(
+        inp,
+        dim,
+        index,
+        value,
+        mode=INDEX_FILL_FUNCTIONAL,
+        prepared=False,
+    )
+    if plan.implementation != INDEX_FILL_CUDA_CPP:
         return None
 
     cpp_func = _get_cpp_index_fill_scalar()
-    if cpp_func is None:
-        return None
     return cpp_func(inp, dim, index, value)
 
 
 def _try_cpp_index_fill_scalar_fast_(out, dim, index, value):
-    if (
-        not _CPP_INDEX_FILL_ENABLED
-        or not _index_fill_uses_device_bounds_check()
-        or not _is_supported_cpp_scalar(value)
-        or not out.is_contiguous()
-    ):
+    plan = _select_cpp_index_fill_plan(
+        out,
+        dim,
+        index,
+        value,
+        mode=INDEX_FILL_INPLACE,
+        prepared=False,
+    )
+    if plan.implementation != INDEX_FILL_CUDA_CPP:
         return None
 
     cpp_func = _get_cpp_index_fill_scalar_inplace()
-    if cpp_func is None:
-        return None
     return cpp_func(out, dim, index, value)
 
 
@@ -534,12 +656,12 @@ def _prepare_index(inp, dim, index):
 
 
 def _check_index_bounds(inp, dim, index):
-    mode = os.environ.get("FLAG_GEMS_INDEX_FILL_BOUNDS_CHECK", "device").lower()
-    if _index_fill_uses_device_bounds_check():
+    mode = _index_fill_bounds_policy()
+    if mode == "device":
         return
 
     dim_size = inp.size(dim)
-    if mode in ("sync", "1", "true", "on"):
+    if mode == "sync":
         min_index = int(torch.min(index).item())
         max_index = int(torch.max(index).item())
         if min_index < -dim_size or max_index >= dim_size:
@@ -599,10 +721,11 @@ def index_fill_scalar(inp, dim, index, value):
         return cpp_out
     dim, index = _prepare_index(inp, dim, index)
     out = _native_clone(inp)
-    if not _should_skip_cpp_index_fill_out(out, dim):
-        cpp_out = _try_cpp_index_fill_scalar_(out, dim, index, value)
-        if cpp_out is not None:
-            return cpp_out
+    cpp_out = _try_cpp_index_fill_scalar_(
+        out, dim, index, value, mode=INDEX_FILL_FUNCTIONAL
+    )
+    if cpp_out is not None:
+        return cpp_out
     return _index_fill_impl(out, dim, index, value, False)
 
 
@@ -620,10 +743,9 @@ def index_fill_scalar_out(inp, dim, index, value, *, out):
     if tuple(out.shape) != tuple(inp.shape):
         out.resize_(inp.shape)
     _native_copy_(out, inp)
-    if not _should_skip_cpp_index_fill_out(out, dim):
-        cpp_out = _try_cpp_index_fill_scalar_(out, dim, index, value)
-        if cpp_out is not None:
-            return cpp_out
+    cpp_out = _try_cpp_index_fill_scalar_(out, dim, index, value, mode=INDEX_FILL_OUT)
+    if cpp_out is not None:
+        return cpp_out
     return _index_fill_impl(out, dim, index, value, False)
 
 
@@ -643,7 +765,9 @@ def index_fill_scalar_(inp, dim, index, value):
     if cpp_out is not None:
         return cpp_out
     dim, index = _prepare_index(inp, dim, index)
-    cpp_out = _try_cpp_index_fill_scalar_(inp, dim, index, value)
+    cpp_out = _try_cpp_index_fill_scalar_(
+        inp, dim, index, value, mode=INDEX_FILL_INPLACE
+    )
     if cpp_out is not None:
         return cpp_out
     return _index_fill_impl(inp, dim, index, value, False)

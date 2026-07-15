@@ -8,10 +8,16 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.index_fill import (
+    INDEX_FILL_ASCENDC,
+    INDEX_FILL_FUNCTIONAL,
+    INDEX_FILL_INPLACE,
+    INDEX_FILL_TRITON,
+    IndexFillPlan,
     _index_fill_uses_device_bounds_check,
     _native_clone,
     _prepare_index,
     _prepare_tensor_value,
+    select_index_fill_plan,
 )
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
@@ -67,26 +73,45 @@ def _is_ascend_910b():
 
 
 def _should_use_ascendc_index_fill(inp, dim, index):
-    return (
-        _ASCENDC_INDEX_FILL_ENABLED
-        and _is_ascend_910b()
-        and inp.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and inp.ndim == 2
-        and inp.shape[0] > 0
-        and inp.shape[1] > 0
-        and inp.numel() <= (1 << 32) - 1
-        and dim in (0, 1)
-        and inp.shape[dim] <= 4096
-        and index.dtype == torch.long
-        and 8 <= index.numel() <= 4096
-        and index.numel() % 8 == 0
-        and inp.is_contiguous()
-        and index.is_contiguous()
+    plan = select_index_fill_plan(
+        inp,
+        dim,
+        index,
+        0.0,
+        backend="npu",
+        mode=INDEX_FILL_FUNCTIONAL,
+        prepared=True,
+        launcher_enabled=_ASCENDC_INDEX_FILL_ENABLED,
+        launcher_available=True,
+        is_ascend_910b=_is_ascend_910b(),
+    )
+    return plan.implementation == INDEX_FILL_ASCENDC
+
+
+def _select_ascendc_index_fill_plan(inp, dim, index, value, *, mode):
+    launcher = (
+        _get_ascendc_index_fill_scalar_inplace
+        if mode == INDEX_FILL_INPLACE
+        else _get_ascendc_index_fill_scalar
+    )
+    return select_index_fill_plan(
+        inp,
+        dim,
+        index,
+        value,
+        backend="npu",
+        mode=mode,
+        prepared=True,
+        launcher_enabled=_ASCENDC_INDEX_FILL_ENABLED,
+        launcher_available=launcher,
+        is_ascend_910b=_is_ascend_910b(),
     )
 
 
 def _try_ascendc_index_fill_scalar(inp, dim, index, value, inplace):
-    if not _should_use_ascendc_index_fill(inp, dim, index):
+    mode = INDEX_FILL_INPLACE if inplace else INDEX_FILL_FUNCTIONAL
+    plan = _select_ascendc_index_fill_plan(inp, dim, index, value, mode=mode)
+    if plan.implementation != INDEX_FILL_ASCENDC:
         return None
     function = (
         _get_ascendc_index_fill_scalar_inplace()
