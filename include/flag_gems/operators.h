@@ -264,5 +264,15 @@ at::Tensor &index_fill_scalar_(at::Tensor &input,
                                int64_t dim,
                                const at::Tensor &index,
                                const c10::Scalar &value);
+#if defined(FLAGGEMS_USE_NPU) && defined(FLAGGEMS_USE_ASCENDC)
+at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
+                                     int64_t dim,
+                                     const at::Tensor &index,
+                                     const c10::Scalar &value);
+at::Tensor &index_fill_ascendc_scalar_(at::Tensor &input,
+                                       int64_t dim,
+                                       const at::Tensor &index,
+                                       const c10::Scalar &value);
+#endif
 
 }  // namespace flag_gems

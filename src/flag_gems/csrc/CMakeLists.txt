@@ -6,6 +6,10 @@ set_target_properties(c_operators PROPERTIES
   CXX_STANDARD_REQUIRED ON)
 target_compile_options(c_operators PRIVATE -std=c++20)
 
+if(FLAGGEMS_BACKEND STREQUAL "NPU" AND FLAGGEMS_ASCENDC_AVAILABLE)
+  target_compile_definitions(c_operators PRIVATE FLAGGEMS_USE_ASCENDC)
+endif()
+
 
 pybind11_add_module(aten_patch aten_patch.cpp)
 target_link_libraries(aten_patch PUBLIC Torch::Torch_Python PRIVATE operators)

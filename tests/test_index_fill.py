@@ -1,3 +1,4 @@
+import importlib
 import os
 import subprocess
 import sys
@@ -249,6 +250,136 @@ def test_index_fill_large_contiguous_membership_duplicate_index():
     utils.gems_assert_equal(actual, ref_out)
     utils.gems_assert_equal(inplace, ref_out)
 
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
+    index_fill_module = importlib.import_module(
+        flag_gems.index_fill_scalar.__module__
+    )
+    functional = index_fill_module._get_ascendc_index_fill_scalar()
+    inplace_function = index_fill_module._get_ascendc_index_fill_scalar_inplace()
+    if functional is None or inplace_function is None:
+        pytest.skip("FlagGems was built without the Ascend C extension")
+
+    calls = {"functional": 0, "inplace": 0}
+
+    def counted_functional(*args):
+        calls["functional"] += 1
+        return functional(*args)
+
+    def counted_inplace(*args):
+        calls["inplace"] += 1
+        return inplace_function(*args)
+
+    monkeypatch.setattr(
+        index_fill_module, "_ASCENDC_INDEX_FILL_SCALAR", counted_functional
+    )
+    monkeypatch.setattr(
+        index_fill_module,
+        "_ASCENDC_INDEX_FILL_SCALAR_INPLACE",
+        counted_inplace,
+    )
+
+    inp = _make_input((4096, 4096), dtype)
+    index = torch.cat(
+        (
+            torch.arange(253, dtype=torch.long, device=flag_gems.device),
+            torch.tensor([1, -1, -1], dtype=torch.long, device=flag_gems.device),
+        )
+    )
+    value = -3.5
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    expected = ref_inp.index_fill(1, ref_index, value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+        inplace = inp.clone()
+        result = inplace.index_fill_(1, index, value)
+
+    assert calls == {"functional": 1, "inplace": 1}
+    assert result is inplace
+    utils.gems_assert_equal(actual, expected)
+    utils.gems_assert_equal(inplace, expected)
+
+    invalid_index = index.clone()
+    invalid_index[0] = inp.size(1)
+    with flag_gems.use_gems(include=INDEX_FILL_OPS), pytest.raises(
+        IndexError, match="index out of range in self"
+    ):
+        inp.index_fill(1, invalid_index, value)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
+)
+@pytest.mark.parametrize(
+    ("shape", "index_len"),
+    [((4096, 256), 16), ((1024, 1024), 128), ((1024, 4096), 2048)],
+)
+def test_index_fill_ascendc_generalized_shape_index(
+    monkeypatch, shape, index_len
+):
+    index_fill_module = importlib.import_module(
+        flag_gems.index_fill_scalar.__module__
+    )
+    functional = index_fill_module._get_ascendc_index_fill_scalar()
+    inplace_function = index_fill_module._get_ascendc_index_fill_scalar_inplace()
+    if functional is None or inplace_function is None:
+        pytest.skip("FlagGems was built without the Ascend C extension")
+
+    calls = {"functional": 0, "inplace": 0}
+
+    def counted_functional(*args):
+        calls["functional"] += 1
+        return functional(*args)
+
+    def counted_inplace(*args):
+        calls["inplace"] += 1
+        return inplace_function(*args)
+
+    monkeypatch.setattr(
+        index_fill_module, "_ASCENDC_INDEX_FILL_SCALAR", counted_functional
+    )
+    monkeypatch.setattr(
+        index_fill_module,
+        "_ASCENDC_INDEX_FILL_SCALAR_INPLACE",
+        counted_inplace,
+    )
+
+    inp = _make_input(shape, torch.float16)
+    index = torch.cat(
+        (
+            torch.arange(
+                index_len - 3, dtype=torch.long, device=flag_gems.device
+            )
+            % shape[1],
+            torch.tensor([1, -1, -1], dtype=torch.long, device=flag_gems.device),
+        )
+    )
+    value = -3.5
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    expected = ref_inp.index_fill(1, ref_index, value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+        inplace = inp.clone()
+        result = inplace.index_fill_(1, index, value)
+
+    assert calls == {"functional": 1, "inplace": 1}
+    assert result is inplace
+    utils.gems_assert_equal(actual, expected)
+    utils.gems_assert_equal(inplace, expected)
 
 
 @pytest.mark.index_fill_out

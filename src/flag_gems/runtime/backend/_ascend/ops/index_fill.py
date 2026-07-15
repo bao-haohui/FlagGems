@@ -21,6 +21,88 @@ from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
 
 logger = logging.getLogger(__name__)
 
+_ASCENDC_INDEX_FILL_SCALAR = None
+_ASCENDC_INDEX_FILL_SCALAR_INPLACE = None
+_ASCENDC_INDEX_FILL_LOOKED_UP = False
+_ASCENDC_IS_910B = None
+_ASCENDC_INDEX_FILL_ENABLED = os.environ.get(
+    "FLAG_GEMS_INDEX_FILL_ASCENDC", "1"
+).lower() not in ("", "0", "false", "off", "none", "disable", "disabled")
+
+
+def _get_ascendc_index_fill_scalar_inplace():
+    global _ASCENDC_INDEX_FILL_SCALAR
+    global _ASCENDC_INDEX_FILL_SCALAR_INPLACE
+    global _ASCENDC_INDEX_FILL_LOOKED_UP
+    if _ASCENDC_INDEX_FILL_LOOKED_UP:
+        return _ASCENDC_INDEX_FILL_SCALAR_INPLACE
+    _ASCENDC_INDEX_FILL_LOOKED_UP = True
+    try:
+        from flag_gems.config import c_operators
+    except ImportError:
+        c_operators = None
+    if c_operators is not None:
+        _ASCENDC_INDEX_FILL_SCALAR = getattr(
+            c_operators, "index_fill_ascendc_scalar", None
+        )
+        _ASCENDC_INDEX_FILL_SCALAR_INPLACE = getattr(
+            c_operators, "index_fill_ascendc_scalar_", None
+        )
+    return _ASCENDC_INDEX_FILL_SCALAR_INPLACE
+
+
+def _get_ascendc_index_fill_scalar():
+    _get_ascendc_index_fill_scalar_inplace()
+    return _ASCENDC_INDEX_FILL_SCALAR
+
+
+def _is_ascend_910b():
+    global _ASCENDC_IS_910B
+    if _ASCENDC_IS_910B is None:
+        try:
+            _ASCENDC_IS_910B = "910B" in torch.npu.get_device_name()
+        except (AttributeError, RuntimeError):
+            _ASCENDC_IS_910B = False
+    return _ASCENDC_IS_910B
+
+
+def _should_use_ascendc_index_fill(inp, dim, index):
+    return (
+        _ASCENDC_INDEX_FILL_ENABLED
+        and _is_ascend_910b()
+        and inp.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and inp.ndim == 2
+        and inp.shape[0] > 0
+        and 0 < inp.shape[1] <= 4096
+        and inp.shape[1] % 16 == 0
+        and (1 << 20) <= inp.numel() <= (1 << 32) - 1
+        and dim == 1
+        and index.dtype == torch.long
+        and 8 <= index.numel() <= 4096
+        and index.numel() % 8 == 0
+        and inp.is_contiguous()
+        and index.is_contiguous()
+    )
+
+
+def _try_ascendc_index_fill_scalar(inp, dim, index, value, inplace):
+    if not _should_use_ascendc_index_fill(inp, dim, index):
+        return None
+    function = (
+        _get_ascendc_index_fill_scalar_inplace()
+        if inplace
+        else _get_ascendc_index_fill_scalar()
+    )
+    if function is None:
+        return None
+    logger.debug("GEMS_ASCEND INDEX_FILL ASCENDC FAST PATH")
+    try:
+        return function(inp, dim, index, value)
+    except RuntimeError as error:
+        if "index out of range in self" in str(error):
+            raise IndexError("index out of range in self") from None
+        raise
+
 
 @libentry()
 @triton.jit(
@@ -620,12 +702,20 @@ def _check_ascend_index_bounds(index, dim_size):
 
 def _prepare_ascend_index(inp, dim, index):
     dim, index = _prepare_index(inp, dim, index)
+    index = index.contiguous()
+    bounds_checked, has_negative = _check_prepared_ascend_index_bounds(
+        inp, dim, index
+    )
+    return dim, index, bounds_checked, has_negative
+
+
+def _check_prepared_ascend_index_bounds(inp, dim, index):
     bounds_checked = False
     has_negative = False
     if index.numel() > 0 and _index_fill_uses_device_bounds_check():
         has_negative = _check_ascend_index_bounds(index, inp.size(dim))
         bounds_checked = True
-    return dim, index.contiguous(), bounds_checked, has_negative
+    return bounds_checked, has_negative
 
 
 def _get_contiguous_config(inner_size):
@@ -993,7 +1083,14 @@ def _index_fill_functional(
 
 def index_fill_scalar(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL SCALAR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index = _prepare_index(inp, dim, index)
+    index = index.contiguous()
+    ascendc_out = _try_ascendc_index_fill_scalar(
+        inp, dim, index, value, inplace=False
+    )
+    if ascendc_out is not None:
+        return ascendc_out
+    bounds_checked, has_negative = _check_prepared_ascend_index_bounds(
         inp, dim, index
     )
     return _index_fill_functional(
@@ -1041,7 +1138,14 @@ def index_fill_tensor_out(inp, dim, index, value, *, out):
 
 def index_fill_scalar_(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL_ SCALAR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index = _prepare_index(inp, dim, index)
+    index = index.contiguous()
+    ascendc_out = _try_ascendc_index_fill_scalar(
+        inp, dim, index, value, inplace=True
+    )
+    if ascendc_out is not None:
+        return ascendc_out
+    bounds_checked, has_negative = _check_prepared_ascend_index_bounds(
         inp, dim, index
     )
     return _index_fill_impl(

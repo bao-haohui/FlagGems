@@ -98,6 +98,36 @@ else()
     message(WARNING "torch_npu not found via Python import")
 endif()
 
+# ------------------------------- Ascend C Integration ------------------------
+set(FLAGGEMS_ASCENDC_AVAILABLE OFF)
+if(FLAGGEMS_BUILD_ASCENDC)
+    set(ASCEND_CANN_PACKAGE_PATH ${ASCEND_HOME})
+    set(FLAGGEMS_ASCENDC_SOC_VERSION "Ascend910B2" CACHE STRING
+        "Ascend C compiler SOC target for FlagGems NPU kernels")
+    if(NOT SOC_VERSION)
+        set(SOC_VERSION "${FLAGGEMS_ASCENDC_SOC_VERSION}")
+    endif()
+    set(_ascendc_cmake_candidates
+        "${ASCEND_HOME}/tools/tikcpp/ascendc_kernel_cmake"
+        "${ASCEND_HOME}/compiler/tikcpp/ascendc_kernel_cmake"
+        "${ASCEND_HOME}/${ASCEND_ARCH_DIR}/tikcpp/ascendc_kernel_cmake"
+    )
+    foreach(_candidate IN LISTS _ascendc_cmake_candidates)
+        if(EXISTS "${_candidate}/ascendc.cmake")
+            set(ASCENDC_CMAKE_DIR "${_candidate}")
+            break()
+        endif()
+    endforeach()
+
+    if(ASCENDC_CMAKE_DIR)
+        message(STATUS "Ascend C SOC target: ${SOC_VERSION}")
+        set(FLAGGEMS_ASCENDC_AVAILABLE ON)
+        message(STATUS "Ascend C kernels enabled from: ${ASCENDC_CMAKE_DIR}")
+    else()
+        message(WARNING "Ascend C CMake package not found; NPU fast paths are disabled")
+    endif()
+endif()
+
 # ------------------------------- Helper Function ------------------------------
 function(target_link_npu_libraries target)
     target_link_libraries(${target} PRIVATE Ascend::ascendcl Ascend::runtime)

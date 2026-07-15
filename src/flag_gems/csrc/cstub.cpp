@@ -268,6 +268,24 @@ PYBIND11_MODULE(c_operators, m) {
   py::class_<IndexFillAtenRegistration>(m, "IndexFillAtenRegistration")
       .def(py::init<>());
 #endif
+#if defined(FLAGGEMS_USE_NPU) && defined(FLAGGEMS_USE_ASCENDC)
+  m.def(
+      "index_fill_ascendc_scalar",
+      [](const at::Tensor &input,
+         int64_t dim,
+         const at::Tensor &index,
+         py::object value) {
+        c10::Scalar scalar = py_object_to_scalar(value);
+        return flag_gems::index_fill_ascendc_scalar(input, dim, index, scalar);
+      });
+  m.def(
+      "index_fill_ascendc_scalar_",
+      [](at::Tensor &input, int64_t dim, const at::Tensor &index, py::object value)
+          -> at::Tensor & {
+        c10::Scalar scalar = py_object_to_scalar(value);
+        return flag_gems::index_fill_ascendc_scalar_(input, dim, index, scalar);
+      });
+#endif
   m.def("fp8_matmul",
         &flag_gems::fp8_matmul,
         py::arg("a"),
