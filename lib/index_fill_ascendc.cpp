@@ -3,7 +3,9 @@
 #include <c10/core/DeviceGuard.h>
 #include <c10/util/BFloat16.h>
 
+#include <algorithm>
 #include <array>
+#include <bitset>
 #include <limits>
 
 #include "aclrtlaunch_flag_gems_index_fill_fused_2d.h"
@@ -19,10 +21,19 @@ namespace {
   constexpr int64_t kMaxIndexCount = 4096;
   constexpr int64_t kIndexAlignment = 8;
   constexpr int64_t kColumnAlignment = 16;
+  constexpr int64_t kMaxDim0InplaceSmallIndexCount = 256;
+  constexpr int64_t kMaxDim0FunctionalSmallIndexCount = 256;
   constexpr uint32_t kBlockDim = 40;
+  constexpr uint32_t kGeneralPath = 0;
+  constexpr uint32_t kDim0InplaceSmallPath = 1;
+  constexpr uint32_t kDim0InplaceSmallDeduplicatePath = 2;
+  constexpr uint32_t kDim0FunctionalSmallDirectPath = 3;
+  constexpr uint32_t kDim0FunctionalSmallMembershipPath = 4;
 
-  void check_index_bounds(const at::Tensor &index, int64_t dim_size, aclrtStream stream) {
+  bool check_index_bounds(const at::Tensor &index, int64_t dim_size, aclrtStream stream, bool check_unique) {
     std::array<int64_t, kMaxIndexCount> host_index;
+    std::bitset<kMaxDimSize> seen;
+    bool all_unique = true;
     const size_t index_bytes = index.numel() * sizeof(int64_t);
     auto status = aclrtMemcpyAsync(host_index.data(),
                                    index_bytes,
@@ -38,7 +49,13 @@ namespace {
     for (int64_t i = 0; i < index.numel(); ++i) {
       const int64_t index_value = host_index[i];
       TORCH_CHECK_INDEX(index_value >= -dim_size && index_value < dim_size, "index out of range in self");
+      if (check_unique) {
+        const int64_t normalized_index = index_value < 0 ? index_value + dim_size : index_value;
+        all_unique = all_unique && !seen.test(normalized_index);
+        seen.set(normalized_index);
+      }
     }
+    return all_unique;
   }
 
   void check_fast_path_args(const at::Tensor &input, int64_t dim, const at::Tensor &index) {
@@ -65,14 +82,25 @@ namespace {
                          const c10::Scalar &value,
                          bool inplace) {
     const int64_t dim_size = input.size(dim);
-    int64_t membership_elements = (dim_size + kColumnAlignment - 1) / kColumnAlignment * kColumnAlignment;
-    if (dim == 1 && membership_elements < kMinVectorElements) {
-      membership_elements = kMinVectorElements;
-    }
-    auto membership = at::empty({membership_elements}, input.options().dtype(at::kHalf));
     c10::DeviceGuard guard(input.device());
     auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
-    check_index_bounds(index, dim_size, stream);
+    const bool dim0_inplace_small_candidate =
+        dim == 0 && inplace && index.numel() <= kMaxDim0InplaceSmallIndexCount;
+    const bool use_dim0_functional_small =
+        dim == 0 && !inplace && index.numel() <= kMaxDim0FunctionalSmallIndexCount;
+    const bool all_unique = check_index_bounds(index, dim_size, stream, dim0_inplace_small_candidate);
+    const bool use_dim0_inplace_small =
+        dim0_inplace_small_candidate && (all_unique || index.numel() == kIndexAlignment);
+    at::Tensor membership;
+    void *membership_ptr = nullptr;
+    if (!use_dim0_inplace_small && !use_dim0_functional_small) {
+      int64_t membership_elements = (dim_size + kColumnAlignment - 1) / kColumnAlignment * kColumnAlignment;
+      if (dim == 1 && membership_elements < kMinVectorElements) {
+        membership_elements = kMinVectorElements;
+      }
+      membership = at::empty({membership_elements}, input.options().dtype(at::kHalf));
+      membership_ptr = membership.data_ptr();
+    }
     const float value_fp32 = static_cast<float>(value.toDouble());
     const uint32_t value_bf16_bits = c10::BFloat16(value_fp32).x;
     const uint32_t rows = input.size(0);
@@ -80,6 +108,15 @@ namespace {
     const uint32_t index_count = index.numel();
     const uint32_t kernel_dim = dim;
     const uint32_t kernel_inplace = inplace ? 1 : 0;
+    uint32_t path_code = kGeneralPath;
+    uint32_t block_dim = kBlockDim;
+    if (use_dim0_inplace_small) {
+      path_code = all_unique ? kDim0InplaceSmallPath : kDim0InplaceSmallDeduplicatePath;
+      block_dim = all_unique ? std::min<uint32_t>(index_count / kIndexAlignment, kBlockDim) : 1;
+    } else if (use_dim0_functional_small) {
+      path_code = index_count <= 16 ? kDim0FunctionalSmallDirectPath : kDim0FunctionalSmallMembershipPath;
+      block_dim = std::min<uint32_t>(rows, kBlockDim);
+    }
 
     uint32_t dtype_code = 0;
     switch (input.scalar_type()) {
@@ -100,7 +137,7 @@ namespace {
                    input_ptr = const_cast<void *>(input.data_ptr()),
                    index_ptr = const_cast<void *>(index.data_ptr()),
                    output_ptr = output.data_ptr(),
-                   membership_ptr = membership.data_ptr(),
+                   membership_ptr,
                    value_fp32,
                    value_bf16_bits,
                    dtype_code,
@@ -108,8 +145,10 @@ namespace {
                    cols,
                    index_count,
                    kernel_dim,
-                   kernel_inplace]() -> int {
-      ACLRT_LAUNCH_KERNEL(flag_gems_index_fill_fused_2d)(kBlockDim,
+                   kernel_inplace,
+                   path_code,
+                   block_dim]() -> int {
+      ACLRT_LAUNCH_KERNEL(flag_gems_index_fill_fused_2d)(block_dim,
                                                          stream,
                                                          input_ptr,
                                                          index_ptr,
@@ -122,7 +161,9 @@ namespace {
                                                          cols,
                                                          index_count,
                                                          kernel_dim,
-                                                         kernel_inplace);
+                                                         kernel_inplace,
+                                                         path_code,
+                                                         block_dim);
       return 0;
     };
     at_npu::native::OpCommand::RunOpApi("flag_gems_index_fill_fused_2d", launch);
