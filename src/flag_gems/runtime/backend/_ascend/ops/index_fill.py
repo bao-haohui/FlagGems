@@ -702,7 +702,6 @@ def _check_ascend_index_bounds(index, dim_size):
 
 def _prepare_ascend_index(inp, dim, index):
     dim, index = _prepare_index(inp, dim, index)
-    index = index.contiguous()
     bounds_checked, has_negative = _check_prepared_ascend_index_bounds(
         inp, dim, index
     )
@@ -1084,7 +1083,6 @@ def _index_fill_functional(
 def index_fill_scalar(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL SCALAR")
     dim, index = _prepare_index(inp, dim, index)
-    index = index.contiguous()
     ascendc_out = _try_ascendc_index_fill_scalar(
         inp, dim, index, value, inplace=False
     )
@@ -1139,7 +1137,6 @@ def index_fill_tensor_out(inp, dim, index, value, *, out):
 def index_fill_scalar_(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL_ SCALAR")
     dim, index = _prepare_index(inp, dim, index)
-    index = index.contiguous()
     ascendc_out = _try_ascendc_index_fill_scalar(
         inp, dim, index, value, inplace=True
     )

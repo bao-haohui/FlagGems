@@ -181,6 +181,81 @@ def test_index_fill_noncontiguous_view():
 
 @pytest.mark.index_fill
 @pytest.mark.index_fill_
+@pytest.mark.parametrize("value_is_tensor", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_index_fill_noncontiguous_index(value_is_tensor, inplace):
+    inp = _make_input((3, 16), torch.float32)
+    index_storage = torch.arange(16, dtype=torch.long, device=flag_gems.device)
+    index = index_storage[::2]
+    value = (
+        torch.tensor(-7.0, dtype=inp.dtype, device=flag_gems.device)
+        if value_is_tensor
+        else -7.0
+    )
+
+    assert not index.is_contiguous()
+    ref_inp = utils.to_reference(inp.clone(), False)
+    ref_index = utils.to_reference(index, False)
+    ref_value = _to_ref_value(value)
+
+    if inplace:
+        ref_inp.index_fill_(1, ref_index, ref_value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            result = inp.index_fill_(1, index, value)
+        assert result is inp
+        utils.gems_assert_equal(inp, ref_inp)
+    else:
+        expected = ref_inp.index_fill(1, ref_index, ref_value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            result = inp.index_fill(1, index, value)
+        assert result is not inp
+        utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "cuda", reason="C++ launcher modes are CUDA-only"
+)
+@pytest.mark.parametrize("launcher_enabled", [False, True])
+def test_index_fill_noncontiguous_index_cuda_launcher_modes(launcher_enabled):
+    child_code = f"""
+import torch
+import flag_gems
+
+ops = {INDEX_FILL_OPS!r}
+for value_is_tensor in (False, True):
+    for inplace in (False, True):
+        inp = torch.arange(48, dtype=torch.float32, device=flag_gems.device).reshape(3, 16)
+        index_storage = torch.arange(16, dtype=torch.long, device=flag_gems.device)
+        index = index_storage[::2]
+        value = torch.tensor(-7.0, device=flag_gems.device) if value_is_tensor else -7.0
+        expected = inp.index_fill(1, index, value)
+
+        with flag_gems.use_gems(include=ops):
+            if inplace:
+                actual = inp.clone()
+                result = actual.index_fill_(1, index, value)
+                assert result is actual
+            else:
+                actual = inp.index_fill(1, index, value)
+        torch.testing.assert_close(actual, expected)
+"""
+    env = os.environ.copy()
+    env["FLAG_GEMS_INDEX_FILL_CPP_LAUNCHER"] = "1" if launcher_enabled else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_index_fill_contiguous_inner3_fast_path(dtype):
     inp = _make_input((4, 17, 3), dtype)

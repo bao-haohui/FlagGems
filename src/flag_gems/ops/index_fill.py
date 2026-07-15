@@ -525,6 +525,7 @@ def _prepare_index(inp, dim, index):
         raise IndexError("index_fill_(): Index is supposed to be a vector")
     if index.ndim == 0:
         index = index.reshape(1)
+    index = index.contiguous()
 
     if index.numel() > 0:
         _check_index_bounds(inp, dim, index)
