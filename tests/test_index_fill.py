@@ -323,11 +323,22 @@ def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
     flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
 )
 @pytest.mark.parametrize(
-    ("shape", "index_len"),
-    [((4096, 256), 16), ((1024, 1024), 128), ((1024, 4096), 2048)],
+    ("shape", "dim", "index_len", "dtype"),
+    [
+        ((3, 17), 1, 8, torch.float16),
+        ((4, 64), 1, 4096, torch.float16),
+        ((4, 257), 1, 8, torch.bfloat16),
+        ((1, 256), 1, 8, torch.float32),
+        ((4096, 256), 1, 16, torch.float16),
+        ((1024, 1024), 1, 128, torch.float16),
+        ((1024, 4096), 1, 2048, torch.float16),
+        ((17, 31), 0, 8, torch.float16),
+        ((257, 4099), 0, 256, torch.bfloat16),
+        ((4, 8193), 0, 4096, torch.float32),
+    ],
 )
 def test_index_fill_ascendc_generalized_shape_index(
-    monkeypatch, shape, index_len
+    monkeypatch, shape, dim, index_len, dtype
 ):
     index_fill_module = importlib.import_module(
         flag_gems.index_fill_scalar.__module__
@@ -356,30 +367,63 @@ def test_index_fill_ascendc_generalized_shape_index(
         counted_inplace,
     )
 
-    inp = _make_input(shape, torch.float16)
+    inp = _make_input(shape, dtype)
     index = torch.cat(
         (
             torch.arange(
                 index_len - 3, dtype=torch.long, device=flag_gems.device
             )
-            % shape[1],
+            % shape[dim],
             torch.tensor([1, -1, -1], dtype=torch.long, device=flag_gems.device),
         )
     )
     value = -3.5
     ref_inp = utils.to_reference(inp, False)
     ref_index = utils.to_reference(index, False)
-    expected = ref_inp.index_fill(1, ref_index, value)
+    expected = ref_inp.index_fill(dim, ref_index, value)
 
     with flag_gems.use_gems(include=INDEX_FILL_OPS):
-        actual = inp.index_fill(1, index, value)
+        actual = inp.index_fill(dim, index, value)
         inplace = inp.clone()
-        result = inplace.index_fill_(1, index, value)
+        result = inplace.index_fill_(dim, index, value)
 
     assert calls == {"functional": 1, "inplace": 1}
     assert result is inplace
     utils.gems_assert_equal(actual, expected)
     utils.gems_assert_equal(inplace, expected)
+
+
+@pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
+)
+@pytest.mark.parametrize(
+    ("shape", "dim", "index_len", "expected"),
+    [
+        ((1, 1), 0, 8, True),
+        ((1, 1), 1, 8, True),
+        ((1, 4097), 0, 8, True),
+        ((4097, 1), 0, 8, False),
+        ((1, 4097), 1, 8, False),
+        ((4, 4), 1, 7, False),
+        ((4, 4), 1, 10, False),
+        ((4, 4), 1, 4104, False),
+    ],
+)
+def test_index_fill_ascendc_dispatch_boundary(
+    monkeypatch, shape, dim, index_len, expected
+):
+    index_fill_module = importlib.import_module(
+        flag_gems.index_fill_scalar.__module__
+    )
+    monkeypatch.setattr(index_fill_module, "_is_ascend_910b", lambda: True)
+    inp = torch.empty(shape, dtype=torch.float16, device=flag_gems.device)
+    index = torch.zeros(index_len, dtype=torch.long, device=flag_gems.device)
+
+    assert (
+        index_fill_module._should_use_ascendc_index_fill(inp, dim, index)
+        is expected
+    )
 
 
 @pytest.mark.index_fill_out

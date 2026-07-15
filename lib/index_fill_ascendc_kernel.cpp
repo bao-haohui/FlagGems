@@ -2,11 +2,16 @@
 
 namespace {
 
-constexpr uint32_t kMaxCols = 4096;
+constexpr uint32_t kMaxDimSize = 4096;
+constexpr uint32_t kMinVectorElements = 256;
 constexpr uint32_t kBlockCount = 40;
 constexpr uint32_t kClearElementsPerCore = 128;
 constexpr uint32_t kIndicesPerCore = 8;
 constexpr uint32_t kBufferNum = 2;
+
+__aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
 
 template <typename T>
 struct IndexFillValue {
@@ -59,6 +64,22 @@ struct IndexFillSelect<bfloat16_t> {
 };
 
 template <typename T>
+struct IndexFillDuplicate {
+  __aicore__ static inline void Run(const AscendC::LocalTensor<T> &output, T value, uint32_t count) {
+    AscendC::Duplicate(output, value, count);
+  }
+};
+
+template <>
+struct IndexFillDuplicate<bfloat16_t> {
+  __aicore__ static inline void Run(const AscendC::LocalTensor<bfloat16_t> &output,
+                                    half value,
+                                    uint32_t count) {
+    AscendC::Duplicate(output.ReinterpretCast<half>(), value, count);
+  }
+};
+
+template <typename T>
 class IndexFillFusedKernel {
  public:
   __aicore__ inline void Init(GM_ADDR input,
@@ -69,24 +90,33 @@ class IndexFillFusedKernel {
                               uint32_t value_bits,
                               uint32_t rows,
                               uint32_t cols,
-                              uint32_t index_count) {
+                              uint32_t index_count,
+                              uint32_t dim,
+                              uint32_t inplace) {
     rows_ = rows;
     cols_ = cols;
     index_count_ = index_count;
+    dim_ = dim;
+    inplace_ = inplace != 0;
+    dim_size_ = dim_ == 0 ? rows_ : cols_;
+    membership_elements_ = AlignUp(dim_size_, 16);
+    if (dim_ == 1 && membership_elements_ < kMinVectorElements) {
+      membership_elements_ = kMinVectorElements;
+    }
     active_builder_cores_ = (index_count_ + kIndicesPerCore - 1) / kIndicesPerCore;
     active_builder_cores_ = active_builder_cores_ < kBlockCount ? active_builder_cores_ : kBlockCount;
     input_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(input), rows_ * cols_);
     index_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(index), index_count_);
     output_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(output), rows_ * cols_);
-    membership_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(membership), cols_);
+    membership_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(membership), membership_elements_);
     value_ = IndexFillValue<T>::Convert(value, value_bits);
 
     pipe_.InitBuffer(clear_buf_, kClearElementsPerCore * sizeof(half));
     pipe_.InitBuffer(index_buf_, kIndicesPerCore * sizeof(int64_t));
-    pipe_.InitBuffer(membership_buf_, kMaxCols * sizeof(half));
-    pipe_.InitBuffer(mask_buf_, kMaxCols / 8);
-    pipe_.InitBuffer(input_queue_, kBufferNum, kMaxCols * sizeof(T));
-    pipe_.InitBuffer(output_queue_, kBufferNum, kMaxCols * sizeof(T));
+    pipe_.InitBuffer(membership_buf_, kMaxDimSize * sizeof(half));
+    pipe_.InitBuffer(mask_buf_, kMaxDimSize / 8);
+    pipe_.InitBuffer(input_queue_, kBufferNum, kMaxDimSize * sizeof(T));
+    pipe_.InitBuffer(output_queue_, kBufferNum, kMaxDimSize * sizeof(T));
   }
 
   __aicore__ inline void Process() {
@@ -94,13 +124,11 @@ class IndexFillFusedKernel {
     AscendC::SyncAll();
     MarkMembership();
     AscendC::SyncAll();
-    BuildMask();
 
-    const uint32_t core = AscendC::GetBlockIdx();
-    for (uint32_t row = core; row < rows_; row += kBlockCount) {
-      CopyIn(row);
-      Compute();
-      CopyOut(row);
+    if (dim_ == 0) {
+      ProcessDim0();
+    } else {
+      ProcessDim1();
     }
   }
 
@@ -108,7 +136,7 @@ class IndexFillFusedKernel {
   __aicore__ inline void ClearMembership() {
     const uint32_t core = AscendC::GetBlockIdx();
     const uint32_t offset = core * kClearElementsPerCore;
-    if (offset >= cols_) {
+    if (offset >= membership_elements_) {
       return;
     }
 
@@ -117,7 +145,9 @@ class IndexFillFusedKernel {
     auto vector_to_mte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vector_to_mte3);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vector_to_mte3);
-    const uint32_t count = cols_ - offset < kClearElementsPerCore ? cols_ - offset : kClearElementsPerCore;
+    const uint32_t count = membership_elements_ - offset < kClearElementsPerCore
+                               ? membership_elements_ - offset
+                               : kClearElementsPerCore;
     AscendC::DataCopy(membership_gm_[offset], clear_local, count);
     auto mte3_to_scalar = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_S));
     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(mte3_to_scalar);
@@ -131,7 +161,7 @@ class IndexFillFusedKernel {
     }
 
     auto local_membership = membership_buf_.Get<half>();
-    AscendC::Duplicate(local_membership, static_cast<half>(0), cols_);
+    AscendC::Duplicate(local_membership, static_cast<half>(0), membership_elements_);
     auto vector_to_scalar = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_S));
     AscendC::SetFlag<AscendC::HardEvent::V_S>(vector_to_scalar);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(vector_to_scalar);
@@ -145,8 +175,8 @@ class IndexFillFusedKernel {
       AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(mte2_to_scalar);
       for (uint32_t i = 0; i < kIndicesPerCore; ++i) {
         int64_t index_value = index_local.GetValue(i);
-        index_value = index_value < 0 ? index_value + static_cast<int64_t>(cols_) : index_value;
-        if (index_value >= 0 && index_value < static_cast<int64_t>(cols_)) {
+        index_value = index_value < 0 ? index_value + static_cast<int64_t>(dim_size_) : index_value;
+        if (index_value >= 0 && index_value < static_cast<int64_t>(dim_size_)) {
           local_membership.SetValue(index_value, static_cast<half>(1));
         }
       }
@@ -155,7 +185,11 @@ class IndexFillFusedKernel {
     AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(scalar_to_mte3);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(scalar_to_mte3);
 
-    AscendC::DataCopyExtParams copy_params {1, static_cast<uint32_t>(cols_ * sizeof(half)), 0, 0, 0};
+    AscendC::DataCopyExtParams copy_params {1,
+                                            static_cast<uint32_t>(membership_elements_ * sizeof(half)),
+                                            0,
+                                            0,
+                                            0};
     AscendC::SetAtomicAdd<half>();
     AscendC::DataCopyPad(membership_gm_, local_membership, copy_params);
     AscendC::SetAtomicNone();
@@ -165,33 +199,118 @@ class IndexFillFusedKernel {
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(mte3_to_scalar);
   }
 
-  __aicore__ inline void BuildMask() {
+  __aicore__ inline void LoadMembership() {
     membership_local_ = membership_buf_.Get<half>();
-    mask_local_ = mask_buf_.Get<uint8_t>();
-    AscendC::DataCopy(membership_local_, membership_gm_, cols_);
-    AscendC::PipeBarrier<PIPE_ALL>();
-    AscendC::CompareScalar(mask_local_, membership_local_, static_cast<half>(0), AscendC::CMPMODE::EQ, cols_);
-    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::DataCopy(membership_local_, membership_gm_, membership_elements_);
   }
 
-  __aicore__ inline void CopyIn(uint32_t row) {
+  __aicore__ inline void ProcessDim0() {
+    LoadMembership();
+    auto mte2_to_scalar = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_S));
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(mte2_to_scalar);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(mte2_to_scalar);
+
+    const uint32_t core = AscendC::GetBlockIdx();
+    for (uint32_t row = core; row < rows_; row += kBlockCount) {
+      const bool selected = membership_local_.ReinterpretCast<uint16_t>().GetValue(row) != 0;
+      if (selected) {
+        FillRow(row);
+      } else if (!inplace_) {
+        CopyRow(row);
+      }
+    }
+  }
+
+  __aicore__ inline void ProcessDim1() {
+    LoadMembership();
+    mask_local_ = mask_buf_.Get<uint8_t>();
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::CompareScalar(mask_local_,
+                           membership_local_,
+                           static_cast<half>(0),
+                           AscendC::CMPMODE::EQ,
+                           membership_elements_);
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    const uint32_t core = AscendC::GetBlockIdx();
+    for (uint32_t row = core; row < rows_; row += kBlockCount) {
+      CopyInDim1(row);
+      ComputeDim1();
+      CopyOutDim1(row);
+    }
+  }
+
+  __aicore__ inline void CopyGlobalToLocal(const AscendC::LocalTensor<T> &local,
+                                           const AscendC::GlobalTensor<T> &global,
+                                           uint32_t count) {
+    if ((count * sizeof(T)) % 32 == 0) {
+      AscendC::DataCopy(local, global, count);
+      return;
+    }
+    AscendC::DataCopyExtParams copy_params {1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<T> pad_params;
+    AscendC::DataCopyPad(local, global, copy_params, pad_params);
+  }
+
+  __aicore__ inline void CopyLocalToGlobal(const AscendC::GlobalTensor<T> &global,
+                                           const AscendC::LocalTensor<T> &local,
+                                           uint32_t count) {
+    if ((count * sizeof(T)) % 32 == 0) {
+      AscendC::DataCopy(global, local, count);
+      return;
+    }
+    AscendC::DataCopyExtParams copy_params {1, static_cast<uint32_t>(count * sizeof(T)), 0, 0, 0};
+    AscendC::DataCopyPad(global, local, copy_params);
+  }
+
+  __aicore__ inline void CopyInDim1(uint32_t row) {
     auto input_local = input_queue_.AllocTensor<T>();
-    AscendC::DataCopy(input_local, input_gm_[row * cols_], cols_);
+    CopyGlobalToLocal(input_local, input_gm_[row * cols_], cols_);
     input_queue_.EnQue(input_local);
   }
 
-  __aicore__ inline void Compute() {
+  __aicore__ inline void ComputeDim1() {
     auto input_local = input_queue_.DeQue<T>();
     auto output_local = output_queue_.AllocTensor<T>();
-    IndexFillSelect<T>::Run(output_local, mask_local_, input_local, value_, cols_);
+    IndexFillSelect<T>::Run(output_local, mask_local_, input_local, value_, membership_elements_);
     output_queue_.EnQue(output_local);
     input_queue_.FreeTensor(input_local);
   }
 
-  __aicore__ inline void CopyOut(uint32_t row) {
+  __aicore__ inline void CopyOutDim1(uint32_t row) {
     auto output_local = output_queue_.DeQue<T>();
-    AscendC::DataCopy(output_gm_[row * cols_], output_local, cols_);
+    CopyLocalToGlobal(output_gm_[row * cols_], output_local, cols_);
     output_queue_.FreeTensor(output_local);
+  }
+
+  __aicore__ inline void CopyRow(uint32_t row) {
+    for (uint32_t col = 0; col < cols_; col += kMaxDimSize) {
+      const uint32_t count = cols_ - col < kMaxDimSize ? cols_ - col : kMaxDimSize;
+      auto input_local = input_queue_.AllocTensor<T>();
+      CopyGlobalToLocal(input_local, input_gm_[row * cols_ + col], count);
+      input_queue_.EnQue(input_local);
+      input_local = input_queue_.DeQue<T>();
+      auto mte2_to_mte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_MTE3));
+      AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(mte2_to_mte3);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(mte2_to_mte3);
+      CopyLocalToGlobal(output_gm_[row * cols_ + col], input_local, count);
+      auto mte3_to_mte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_MTE2));
+      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3_to_mte2);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3_to_mte2);
+      input_queue_.FreeTensor(input_local);
+    }
+  }
+
+  __aicore__ inline void FillRow(uint32_t row) {
+    for (uint32_t col = 0; col < cols_; col += kMaxDimSize) {
+      const uint32_t count = cols_ - col < kMaxDimSize ? cols_ - col : kMaxDimSize;
+      auto output_local = output_queue_.AllocTensor<T>();
+      IndexFillDuplicate<T>::Run(output_local, value_, count);
+      output_queue_.EnQue(output_local);
+      output_local = output_queue_.DeQue<T>();
+      CopyLocalToGlobal(output_gm_[row * cols_ + col], output_local, count);
+      output_queue_.FreeTensor(output_local);
+    }
   }
 
   AscendC::TPipe pipe_;
@@ -211,33 +330,39 @@ class IndexFillFusedKernel {
   uint32_t rows_;
   uint32_t cols_;
   uint32_t index_count_;
+  uint32_t dim_;
+  uint32_t dim_size_;
+  uint32_t membership_elements_;
   uint32_t active_builder_cores_;
+  bool inplace_;
 };
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void flag_gems_index_fill_fused_2d_dim1(GM_ADDR input,
-                                                                         GM_ADDR index,
-                                                                         GM_ADDR output,
-                                                                         GM_ADDR membership,
-                                                                         float value,
-                                                                         uint32_t value_bits,
-                                                                         uint32_t dtype_code,
-                                                                         uint32_t rows,
-                                                                         uint32_t cols,
-                                                                         uint32_t index_count) {
+extern "C" __global__ __aicore__ void flag_gems_index_fill_fused_2d(GM_ADDR input,
+                                                                    GM_ADDR index,
+                                                                    GM_ADDR output,
+                                                                    GM_ADDR membership,
+                                                                    float value,
+                                                                    uint32_t value_bits,
+                                                                    uint32_t dtype_code,
+                                                                    uint32_t rows,
+                                                                    uint32_t cols,
+                                                                    uint32_t index_count,
+                                                                    uint32_t dim,
+                                                                    uint32_t inplace) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
   if (dtype_code == 0) {
     IndexFillFusedKernel<half> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count);
+    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
     kernel.Process();
   } else if (dtype_code == 1) {
     IndexFillFusedKernel<bfloat16_t> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count);
+    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
     kernel.Process();
   } else {
     IndexFillFusedKernel<float> kernel;
-    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count);
+    kernel.Init(input, index, output, membership, value, value_bits, rows, cols, index_count, dim, inplace);
     kernel.Process();
   }
 }

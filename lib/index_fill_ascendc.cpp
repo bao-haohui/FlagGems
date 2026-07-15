@@ -6,7 +6,7 @@
 #include <array>
 #include <limits>
 
-#include "aclrtlaunch_flag_gems_index_fill_fused_2d_dim1.h"
+#include "aclrtlaunch_flag_gems_index_fill_fused_2d.h"
 #include "flag_gems/operators.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
@@ -14,11 +14,11 @@
 namespace flag_gems {
 namespace {
 
-  constexpr int64_t kMaxCols = 4096;
+  constexpr int64_t kMaxDimSize = 4096;
+  constexpr int64_t kMinVectorElements = 256;
   constexpr int64_t kMaxIndexCount = 4096;
   constexpr int64_t kIndexAlignment = 8;
   constexpr int64_t kColumnAlignment = 16;
-  constexpr int64_t kMinElements = 1 << 20;
   constexpr uint32_t kBlockDim = 40;
 
   void check_index_bounds(const at::Tensor &index, int64_t dim_size, aclrtStream stream) {
@@ -45,11 +45,11 @@ namespace {
     TORCH_CHECK(input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16 ||
                     input.scalar_type() == at::kFloat,
                 "Ascend C index_fill fast path requires float16, bfloat16, or float32 input");
-    TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) > 0 && input.size(1) <= kMaxCols &&
-                    input.size(1) % kColumnAlignment == 0 && input.numel() >= kMinElements &&
+    TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) > 0 &&
                     input.numel() <= std::numeric_limits<uint32_t>::max(),
                 "Ascend C index_fill fast path received an unsupported input shape");
-    TORCH_CHECK(dim == 1, "Ascend C index_fill fast path requires dim=1");
+    TORCH_CHECK((dim == 0 || dim == 1) && input.size(dim) <= kMaxDimSize,
+                "Ascend C index_fill fast path received an unsupported dimension");
     TORCH_CHECK(index.scalar_type() == at::kLong && index.numel() >= kIndexAlignment &&
                     index.numel() <= kMaxIndexCount && index.numel() % kIndexAlignment == 0,
                 "Ascend C index_fill fast path received an unsupported int64 index length");
@@ -59,18 +59,27 @@ namespace {
   }
 
   void launch_index_fill(const at::Tensor &input,
+                         int64_t dim,
                          const at::Tensor &index,
                          at::Tensor &output,
-                         const c10::Scalar &value) {
-    auto membership = at::empty({input.size(1)}, input.options().dtype(at::kHalf));
+                         const c10::Scalar &value,
+                         bool inplace) {
+    const int64_t dim_size = input.size(dim);
+    int64_t membership_elements = (dim_size + kColumnAlignment - 1) / kColumnAlignment * kColumnAlignment;
+    if (dim == 1 && membership_elements < kMinVectorElements) {
+      membership_elements = kMinVectorElements;
+    }
+    auto membership = at::empty({membership_elements}, input.options().dtype(at::kHalf));
     c10::DeviceGuard guard(input.device());
     auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
-    check_index_bounds(index, input.size(1), stream);
+    check_index_bounds(index, dim_size, stream);
     const float value_fp32 = static_cast<float>(value.toDouble());
     const uint32_t value_bf16_bits = c10::BFloat16(value_fp32).x;
     const uint32_t rows = input.size(0);
     const uint32_t cols = input.size(1);
     const uint32_t index_count = index.numel();
+    const uint32_t kernel_dim = dim;
+    const uint32_t kernel_inplace = inplace ? 1 : 0;
 
     uint32_t dtype_code = 0;
     switch (input.scalar_type()) {
@@ -97,22 +106,26 @@ namespace {
                    dtype_code,
                    rows,
                    cols,
-                   index_count]() -> int {
-      ACLRT_LAUNCH_KERNEL(flag_gems_index_fill_fused_2d_dim1)(kBlockDim,
-                                                              stream,
-                                                              input_ptr,
-                                                              index_ptr,
-                                                              output_ptr,
-                                                              membership_ptr,
-                                                              value_fp32,
-                                                              value_bf16_bits,
-                                                              dtype_code,
-                                                              rows,
-                                                              cols,
-                                                              index_count);
+                   index_count,
+                   kernel_dim,
+                   kernel_inplace]() -> int {
+      ACLRT_LAUNCH_KERNEL(flag_gems_index_fill_fused_2d)(kBlockDim,
+                                                         stream,
+                                                         input_ptr,
+                                                         index_ptr,
+                                                         output_ptr,
+                                                         membership_ptr,
+                                                         value_fp32,
+                                                         value_bf16_bits,
+                                                         dtype_code,
+                                                         rows,
+                                                         cols,
+                                                         index_count,
+                                                         kernel_dim,
+                                                         kernel_inplace);
       return 0;
     };
-    at_npu::native::OpCommand::RunOpApi("flag_gems_index_fill_fused_2d_dim1", launch);
+    at_npu::native::OpCommand::RunOpApi("flag_gems_index_fill_fused_2d", launch);
   }
 
 }  // namespace
@@ -123,7 +136,7 @@ at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
                                      const c10::Scalar &value) {
   check_fast_path_args(input, dim, index);
   at::Tensor output = at::empty_like(input);
-  launch_index_fill(input, index, output, value);
+  launch_index_fill(input, dim, index, output, value, false);
   return output;
 }
 
@@ -132,7 +145,7 @@ at::Tensor &index_fill_ascendc_scalar_(at::Tensor &input,
                                        const at::Tensor &index,
                                        const c10::Scalar &value) {
   check_fast_path_args(input, dim, index);
-  launch_index_fill(input, index, input, value);
+  launch_index_fill(input, dim, index, input, value, true);
   return input;
 }
 

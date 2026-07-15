@@ -73,10 +73,10 @@ def _should_use_ascendc_index_fill(inp, dim, index):
         and inp.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and inp.ndim == 2
         and inp.shape[0] > 0
-        and 0 < inp.shape[1] <= 4096
-        and inp.shape[1] % 16 == 0
-        and (1 << 20) <= inp.numel() <= (1 << 32) - 1
-        and dim == 1
+        and inp.shape[1] > 0
+        and inp.numel() <= (1 << 32) - 1
+        and dim in (0, 1)
+        and inp.shape[dim] <= 4096
         and index.dtype == torch.long
         and 8 <= index.numel() <= 4096
         and index.numel() % 8 == 0

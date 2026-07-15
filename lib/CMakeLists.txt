@@ -40,7 +40,7 @@ if(FLAGGEMS_BACKEND STREQUAL "NPU" AND FLAGGEMS_ASCENDC_AVAILABLE)
   set(_index_fill_ascendc_include_dir
     "${_index_fill_ascendc_build_dir}/include/index_fill_ascendc_kernel")
   set(_index_fill_ascendc_launcher
-    "${_index_fill_ascendc_include_dir}/aclrtlaunch_flag_gems_index_fill_fused_2d_dim1.h")
+    "${_index_fill_ascendc_include_dir}/aclrtlaunch_flag_gems_index_fill_fused_2d.h")
   file(MAKE_DIRECTORY "${_index_fill_ascendc_include_dir}")
 
   add_custom_command(
