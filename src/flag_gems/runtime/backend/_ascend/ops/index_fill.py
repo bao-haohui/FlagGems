@@ -139,7 +139,7 @@ def _try_ascendc_index_fill_scalar(inp, dim, index, value, inplace):
         "inner_size",
     ]
 )
-def index_fill_contiguous_scalar_kernel(
+def index_fill_contiguous_kernel(
     out,
     index,
     value,
@@ -147,6 +147,7 @@ def index_fill_contiguous_scalar_kernel(
     index_len,
     dim_size,
     inner_size,
+    VALUE_IS_TENSOR: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -171,51 +172,10 @@ def index_fill_contiguous_scalar_kernel(
 
     store_mask = m_mask[:, None] & (inner_offsets[None, :] < inner_size)
     store_mask &= valid_index[:, None]
-    tl.store(out + out_offsets, value, mask=store_mask)
-
-
-@libentry()
-@triton.jit(
-    do_not_specialize=[
-        "outer_index_len",
-        "index_len",
-        "dim_size",
-        "inner_size",
-    ]
-)
-def index_fill_contiguous_tensor_kernel(
-    out,
-    index,
-    value,
-    outer_index_len,
-    index_len,
-    dim_size,
-    inner_size,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = ext.program_id(axis=0)
-    pid_n = ext.program_id(axis=1)
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    inner_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    m_mask = m_offsets < outer_index_len
-    index_coord = m_offsets % index_len
-    outer_coord = m_offsets // index_len
-    raw_index = tl.load(index + index_coord, mask=m_mask, other=0).to(tl.int64)
-    valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
-    tl.device_assert((~m_mask) | valid_index, "index out of bounds")
-    normalized_index = tl.where(
-        raw_index < 0, raw_index + dim_size, raw_index
-    ).to(tl.int64)
-
-    out_offsets = outer_coord[:, None].to(tl.int64) * dim_size * inner_size
-    out_offsets += normalized_index[:, None] * inner_size
-    out_offsets += inner_offsets[None, :]
-
-    store_mask = m_mask[:, None] & (inner_offsets[None, :] < inner_size)
-    store_mask &= valid_index[:, None]
-    fill_value = tl.load(value)
+    if VALUE_IS_TENSOR:
+        fill_value = tl.load(value)
+    else:
+        fill_value = value
     tl.store(out + out_offsets, fill_value, mask=store_mask)
 
 
@@ -227,7 +187,7 @@ def index_fill_contiguous_tensor_kernel(
         "dim_size",
     ]
 )
-def index_fill_contiguous_scalar_inner1_kernel(
+def index_fill_contiguous_inner1_kernel(
     out,
     index,
     value,
@@ -235,6 +195,7 @@ def index_fill_contiguous_scalar_inner1_kernel(
     dim_size,
     HAS_NEGATIVE: tl.constexpr,
     USE_INT32: tl.constexpr,
+    VALUE_IS_TENSOR: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
     pid_outer = ext.program_id(axis=0)
@@ -263,56 +224,13 @@ def index_fill_contiguous_scalar_inner1_kernel(
             )
         out_offsets = pid_outer.to(tl.int64) * dim_size_i64 + index_values
 
-    tl.store(out + out_offsets, value, mask=index_mask)
-
-
-@libentry()
-@triton.jit(
-    do_not_specialize=[
-        "index_len",
-        "dim_size",
-    ]
-)
-def index_fill_contiguous_tensor_inner1_kernel(
-    out,
-    index,
-    value,
-    index_len,
-    dim_size,
-    HAS_NEGATIVE: tl.constexpr,
-    USE_INT32: tl.constexpr,
-    BLOCK_I: tl.constexpr,
-):
-    pid_outer = ext.program_id(axis=0)
-    pid_index = ext.program_id(axis=1)
-    index_offsets = pid_index.to(tl.int32) * BLOCK_I + tl.arange(0, BLOCK_I)
-    index_mask = index_offsets < index_len.to(tl.int32)
-
-    if USE_INT32:
-        dim_size_i32 = dim_size.to(tl.int32)
-        index_values = tl.load(index + index_offsets, mask=index_mask, other=0).to(
-            tl.int32
-        )
-        if HAS_NEGATIVE:
-            index_values = tl.where(
-                index_values < 0, index_values + dim_size_i32, index_values
-            )
-        out_offsets = pid_outer.to(tl.int32) * dim_size_i32 + index_values
+    if VALUE_IS_TENSOR:
+        fill_value = tl.load(value)
     else:
-        dim_size_i64 = dim_size.to(tl.int64)
-        index_values = tl.load(index + index_offsets, mask=index_mask, other=0).to(
-            tl.int64
-        )
-        if HAS_NEGATIVE:
-            index_values = tl.where(
-                index_values < 0, index_values + dim_size_i64, index_values
-            )
-        out_offsets = pid_outer.to(tl.int64) * dim_size_i64 + index_values
+        fill_value = value
+    tl.store(out + out_offsets, fill_value, mask=index_mask)
 
 
-
-
-    tl.store(out + out_offsets, tl.load(value), mask=index_mask)
 @libentry()
 @triton.jit(
     do_not_specialize=[
@@ -928,28 +846,17 @@ def _index_fill_contiguous_inner1(
     use_int32 = _use_int32_indexing(out, dim_size, index_len)
 
     with torch_device_fn.device(out.device):
-        if value_is_tensor:
-            index_fill_contiguous_tensor_inner1_kernel[grid](
-                out,
-                index,
-                value,
-                index_len,
-                dim_size,
-                HAS_NEGATIVE=has_negative,
-                USE_INT32=use_int32,
-                BLOCK_I=block_i,
-            )
-        else:
-            index_fill_contiguous_scalar_inner1_kernel[grid](
-                out,
-                index,
-                value,
-                index_len,
-                dim_size,
-                HAS_NEGATIVE=has_negative,
-                USE_INT32=use_int32,
-                BLOCK_I=block_i,
-            )
+        index_fill_contiguous_inner1_kernel[grid](
+            out,
+            index,
+            value,
+            index_len,
+            dim_size,
+            HAS_NEGATIVE=has_negative,
+            USE_INT32=use_int32,
+            VALUE_IS_TENSOR=value_is_tensor,
+            BLOCK_I=block_i,
+        )
     return out
 
 
@@ -1008,30 +915,18 @@ def _index_fill_contiguous(
     )
 
     with torch_device_fn.device(out.device):
-        if value_is_tensor:
-            index_fill_contiguous_tensor_kernel[grid](
-                out,
-                index,
-                value,
-                outer_index_len,
-                index.numel(),
-                dim_size,
-                inner_size,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
-            )
-        else:
-            index_fill_contiguous_scalar_kernel[grid](
-                out,
-                index,
-                value,
-                outer_index_len,
-                index.numel(),
-                dim_size,
-                inner_size,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
-            )
+        index_fill_contiguous_kernel[grid](
+            out,
+            index,
+            value,
+            outer_index_len,
+            index.numel(),
+            dim_size,
+            inner_size,
+            VALUE_IS_TENSOR=value_is_tensor,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+        )
     return out
 
 
