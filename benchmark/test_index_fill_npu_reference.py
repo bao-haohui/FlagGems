@@ -6,6 +6,7 @@ elements on the host before dispatching its index_fill implementation.
 """
 
 import gc
+import importlib
 import os
 import statistics
 import time
@@ -17,7 +18,12 @@ import torch
 from . import base, consts
 from .ascend_index_fill_reference import index_fill as aclnn_index_fill
 from .ascend_index_fill_reference import index_fill_ as aclnn_index_fill_
-from .test_index_fill import INDEX_FILL_DTYPES, _base_inputs, _scalar_value
+from .test_index_fill import (
+    INDEX_FILL_DTYPES,
+    _base_inputs,
+    _dim0_case_variant,
+    _scalar_value,
+)
 
 
 _SAMPLES_ENV = "FLAGGEMS_INDEX_FILL_REFERENCE_SAMPLES"
@@ -103,13 +109,30 @@ def _assert_correct(torch_op, aclnn_op, args, is_inplace):
     torch.testing.assert_close(actual, expected)
 
 
+def _selected_implementation(inp, dim, index, value, is_inplace):
+    index_fill_module = importlib.import_module(flag_gems.index_fill_scalar.__module__)
+    mode = (
+        index_fill_module.INDEX_FILL_INPLACE
+        if is_inplace
+        else index_fill_module.INDEX_FILL_FUNCTIONAL
+    )
+    plan = index_fill_module._select_ascendc_index_fill_plan(
+        inp, dim, index, value, mode=mode
+    )
+    if plan.implementation != index_fill_module.INDEX_FILL_ASCENDC:
+        return plan.implementation
+
+    variant = _dim0_case_variant(inp.shape, dim, index.numel())
+    return f"ascendc_dim0_{variant}" if variant else "ascendc_general"
+
+
 def _print_header(op_name, samples):
     print(
         f"\n{op_name}: synchronized P50 of {samples} independent calls "
         "(direct ACLNN / FlagGems)"
     )
     print(
-        f"{'dtype':<14} {'shape':<22} {'dim':>4} {'index':>8} "
+        f"{'dtype':<14} {'shape':<22} {'dim':>4} {'index':>8} {'path':<24} "
         f"{'ACLNN ms':>12} {'Gems ms':>12} {'ACLNN/Gems':>12}"
     )
 
@@ -131,7 +154,11 @@ def _run(op_name, torch_op, aclnn_op, is_inplace):
     for dtype in dtypes:
         for shape in _shapes():
             for inp, dim, index in _base_inputs(shape, dtype, base.device):
-                args = (inp, dim, index, _scalar_value(dtype))
+                value = _scalar_value(dtype)
+                args = (inp, dim, index, value)
+                implementation = _selected_implementation(
+                    inp, dim, index, value, is_inplace
+                )
                 _assert_correct(torch_op, aclnn_op, args, is_inplace)
 
                 _prewarm(aclnn_op, args, is_inplace)
@@ -145,7 +172,8 @@ def _run(op_name, torch_op, aclnn_op, is_inplace):
 
                 print(
                     f"{str(dtype):<14} {str(tuple(shape)):<22} {dim:>4} "
-                    f"{index.numel():>8} {aclnn_latency:>12.6f} "
+                    f"{index.numel():>8} {implementation:<24} "
+                    f"{aclnn_latency:>12.6f} "
                     f"{gems_latency:>12.6f} "
                     f"{aclnn_latency / gems_latency:>12.3f}"
                 )

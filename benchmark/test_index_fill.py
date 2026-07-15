@@ -8,6 +8,11 @@ from . import base, consts
 INDEX_RATIOS = ("1/16", "1/2", "full")
 INDEX_FILL_DTYPES = [torch.float16, torch.float32, torch.bfloat16]
 MIN_SELECTED_NUMEL = 16 * 1024
+DIM0_BENCHMARK_CASES = {
+    (4096, 256): ((8, "small"),),
+    (4096, 4096): ((512, "general"),),
+    (8192, 4096): ((4096, "fallback"),),
+}
 
 
 class IndexFillBenchmark(base.GenericBenchmark):
@@ -54,8 +59,12 @@ def _generate_input(shape, dtype, device):
     return torch.randint(-10, 10, shape, dtype=dtype, device=device)
 
 
-def _dim_for_shape(shape):
-    return 0 if len(shape) == 1 else 1
+def _dims_for_shape(shape):
+    if len(shape) == 1:
+        return (0,)
+    if len(shape) == 2 and tuple(shape) in DIM0_BENCHMARK_CASES:
+        return (1, 0)
+    return (1,)
 
 
 def _index_len(dim_size, ratio):
@@ -81,20 +90,30 @@ def _scalar_value(dtype):
 
 
 def _base_inputs(shape, dtype, device):
-    dim = _dim_for_shape(shape)
-    dim_size = shape[dim]
-    seen_index_lens = set()
-    for ratio in INDEX_RATIOS:
-        index_len = _index_len(dim_size, ratio)
-        if index_len in seen_index_lens:
-            continue
-        seen_index_lens.add(index_len)
-        selected_numel = math.prod(shape) // dim_size * index_len
-        if selected_numel < MIN_SELECTED_NUMEL:
-            continue
-        inp = _generate_input(shape, dtype, device)
-        index = _make_index(dim_size, index_len, device)
-        yield inp, dim, index
+    for dim in _dims_for_shape(shape):
+        dim_size = shape[dim]
+        dim0_cases = DIM0_BENCHMARK_CASES.get(tuple(shape), ()) if dim == 0 else ()
+        if dim0_cases:
+            index_lens = [index_len for index_len, _ in dim0_cases]
+        else:
+            index_lens = [_index_len(dim_size, ratio) for ratio in INDEX_RATIOS]
+
+        for index_len in dict.fromkeys(index_lens):
+            selected_numel = math.prod(shape) // dim_size * index_len
+            if not dim0_cases and selected_numel < MIN_SELECTED_NUMEL:
+                continue
+            inp = _generate_input(shape, dtype, device)
+            index = _make_index(dim_size, index_len, device)
+            yield inp, dim, index
+
+
+def _dim0_case_variant(shape, dim, index_len):
+    if dim != 0:
+        return None
+    for case_index_len, variant in DIM0_BENCHMARK_CASES.get(tuple(shape), ()):
+        if index_len == case_index_len:
+            return variant
+    return None
 
 
 def _selected_numel(inp, dim, index):
