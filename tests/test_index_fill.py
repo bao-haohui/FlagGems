@@ -218,12 +218,31 @@ def test_index_fill_noncontiguous_index(value_is_tensor, inplace):
     flag_gems.device != "cuda", reason="C++ launcher modes are CUDA-only"
 )
 @pytest.mark.parametrize("launcher_enabled", [False, True])
-def test_index_fill_noncontiguous_index_cuda_launcher_modes(launcher_enabled):
+def test_index_fill_noncontiguous_index_cuda_dispatch_paths(launcher_enabled):
+    if launcher_enabled:
+        from flag_gems.config import c_operators
+
+        if c_operators is None or not hasattr(
+            c_operators, "IndexFillAtenRegistration"
+        ):
+            pytest.skip("FlagGems was built without the CUDA C++ launcher")
+
     child_code = f"""
+import importlib
 import torch
 import flag_gems
 
 ops = {INDEX_FILL_OPS!r}
+index_fill_module = importlib.import_module("flag_gems.ops.index_fill")
+original_impl = index_fill_module._index_fill_impl
+triton_calls = 0
+
+def counted_impl(*args, **kwargs):
+    global triton_calls
+    triton_calls += 1
+    return original_impl(*args, **kwargs)
+
+index_fill_module._index_fill_impl = counted_impl
 for value_is_tensor in (False, True):
     for inplace in (False, True):
         inp = torch.arange(48, dtype=torch.float32, device=flag_gems.device).reshape(3, 16)
@@ -240,6 +259,9 @@ for value_is_tensor in (False, True):
             else:
                 actual = inp.index_fill(1, index, value)
         torch.testing.assert_close(actual, expected)
+
+expected_triton_calls = {2 if launcher_enabled else 4}
+assert triton_calls == expected_triton_calls, (triton_calls, expected_triton_calls)
 """
     env = os.environ.copy()
     env["FLAG_GEMS_INDEX_FILL_CPP_LAUNCHER"] = "1" if launcher_enabled else "0"
@@ -298,6 +320,7 @@ def test_index_fill_large_contiguous_membership_functional(value_is_tensor):
 
     assert actual is not inp
     utils.gems_assert_equal(actual, ref_out)
+
 
 @pytest.mark.index_fill
 @pytest.mark.index_fill_
@@ -362,6 +385,14 @@ def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
         counted_inplace,
     )
 
+    def unexpected_triton(*args, **kwargs):
+        pytest.fail("AscendC-supported index_fill fell back to Triton")
+
+    monkeypatch.setattr(
+        index_fill_module, "_index_fill_functional", unexpected_triton
+    )
+    monkeypatch.setattr(index_fill_module, "_index_fill_impl", unexpected_triton)
+
     inp = _make_input((4096, 4096), dtype)
     index = torch.cat(
         (
@@ -390,6 +421,95 @@ def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
         IndexError, match="index out of range in self"
     ):
         inp.index_fill(1, invalid_index, value)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
+)
+@pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tensor_value",
+        "noncontiguous_input",
+        "unsupported_dtype",
+        "unsupported_shape",
+        "unsupported_dim",
+    ],
+)
+def test_index_fill_ascendc_fallback_paths(monkeypatch, case, inplace):
+    index_fill_module = importlib.import_module(
+        flag_gems.index_fill_scalar.__module__
+    )
+    ascendc_calls = 0
+
+    def unexpected_ascendc(*args, **kwargs):
+        nonlocal ascendc_calls
+        ascendc_calls += 1
+        pytest.fail(f"{case} unexpectedly selected the AscendC fast path")
+
+    monkeypatch.setattr(
+        index_fill_module, "_ASCENDC_INDEX_FILL_LOOKED_UP", True
+    )
+    monkeypatch.setattr(
+        index_fill_module, "_ASCENDC_INDEX_FILL_SCALAR", unexpected_ascendc
+    )
+    monkeypatch.setattr(
+        index_fill_module,
+        "_ASCENDC_INDEX_FILL_SCALAR_INPLACE",
+        unexpected_ascendc,
+    )
+
+    if case == "noncontiguous_input":
+        inp = _make_input((16, 3), torch.float16).t()
+    elif case == "unsupported_dtype":
+        inp = _make_input((3, 16), torch.int32)
+    elif case == "unsupported_shape":
+        inp = _make_input((2, 4104), torch.float16)
+    elif case == "unsupported_dim":
+        inp = _make_input((2, 3, 16), torch.float16)
+    else:
+        inp = _make_input((3, 16), torch.float16)
+
+    dim = 2 if case == "unsupported_dim" else 1
+    index = torch.arange(8, dtype=torch.long, device=flag_gems.device)
+    value = (
+        torch.tensor(-3.5, dtype=inp.dtype, device=flag_gems.device)
+        if case == "tensor_value"
+        else _scalar_value(inp.dtype)
+    )
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_value = _to_ref_value(value)
+
+    generic_path = "_index_fill_impl" if inplace else "_index_fill_functional"
+    original_generic = getattr(index_fill_module, generic_path)
+    generic_calls = 0
+
+    def counted_generic(*args, **kwargs):
+        nonlocal generic_calls
+        generic_calls += 1
+        return original_generic(*args, **kwargs)
+
+    monkeypatch.setattr(index_fill_module, generic_path, counted_generic)
+
+    if inplace:
+        ref_inp.index_fill_(dim, ref_index, ref_value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            result = inp.index_fill_(dim, index, value)
+        assert result is inp
+        actual = inp
+        expected = ref_inp
+    else:
+        expected = ref_inp.index_fill(dim, ref_index, ref_value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            actual = inp.index_fill(dim, index, value)
+
+    assert ascendc_calls == 0
+    assert generic_calls == 1
+    utils.gems_assert_equal(actual, expected)
 
 
 @pytest.mark.index_fill
