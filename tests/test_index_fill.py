@@ -429,6 +429,80 @@ def test_index_fill_ascendc_fast_path(monkeypatch, dtype):
     flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
 )
 @pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("index_case", ["tail", "mixed", "dense"])
+@pytest.mark.parametrize("shape", [(4, 257), (8, 513), (17, 4095)])
+def test_index_fill_ascendc_bf16_tail(
+    monkeypatch, shape, index_case, inplace
+):
+    index_fill_module = importlib.import_module(
+        flag_gems.index_fill_scalar.__module__
+    )
+    ascendc_function = (
+        index_fill_module._get_ascendc_index_fill_scalar_inplace()
+        if inplace
+        else index_fill_module._get_ascendc_index_fill_scalar()
+    )
+    if ascendc_function is None:
+        pytest.skip("FlagGems was built without the Ascend C extension")
+
+    calls = 0
+
+    def counted_ascendc(*args):
+        nonlocal calls
+        calls += 1
+        return ascendc_function(*args)
+
+    ascendc_name = (
+        "_ASCENDC_INDEX_FILL_SCALAR_INPLACE"
+        if inplace
+        else "_ASCENDC_INDEX_FILL_SCALAR"
+    )
+    monkeypatch.setattr(index_fill_module, ascendc_name, counted_ascendc)
+
+    inp = _make_input(shape, torch.bfloat16)
+    if index_case == "tail":
+        index = torch.full(
+            (8,), -1, dtype=torch.long, device=flag_gems.device
+        )
+    elif index_case == "mixed":
+        index = torch.tensor(
+            [0, 1, 255, -1, 0, 1, 255, -1],
+            dtype=torch.long,
+            device=flag_gems.device,
+        )
+    else:
+        index_len = min(((shape[1] + 7) // 8) * 8, 4096)
+        index = torch.arange(
+            index_len, dtype=torch.long, device=flag_gems.device
+        ) % shape[1]
+        index[-1] = -1
+
+    value = -3.5
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+
+    if inplace:
+        ref_inp.index_fill_(1, ref_index, value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            result = inp.index_fill_(1, index, value)
+        assert result is inp
+        actual = inp
+        expected = ref_inp
+    else:
+        expected = ref_inp.index_fill(1, ref_index, value)
+        with flag_gems.use_gems(include=INDEX_FILL_OPS):
+            actual = inp.index_fill(1, index, value)
+
+    assert calls == 1
+    utils.gems_assert_equal(actual, expected)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "npu", reason="Ascend C fast path is NPU-only"
+)
+@pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize(
     "case",
     [

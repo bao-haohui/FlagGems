@@ -17,7 +17,7 @@ namespace flag_gems {
 namespace {
 
   constexpr int64_t kMaxDimSize = 4096;
-  constexpr int64_t kMinVectorElements = 256;
+  constexpr int64_t kDim1VectorAlignment = 256;
   constexpr int64_t kMaxIndexCount = 4096;
   constexpr int64_t kIndexAlignment = 8;
   constexpr int64_t kColumnAlignment = 16;
@@ -94,10 +94,9 @@ namespace {
     at::Tensor membership;
     void *membership_ptr = nullptr;
     if (!use_dim0_inplace_small && !use_dim0_functional_small) {
-      int64_t membership_elements = (dim_size + kColumnAlignment - 1) / kColumnAlignment * kColumnAlignment;
-      if (dim == 1 && membership_elements < kMinVectorElements) {
-        membership_elements = kMinVectorElements;
-      }
+      const int64_t membership_alignment = dim == 1 ? kDim1VectorAlignment : kColumnAlignment;
+      const int64_t membership_elements =
+          (dim_size + membership_alignment - 1) / membership_alignment * membership_alignment;
       membership = at::empty({membership_elements}, input.options().dtype(at::kHalf));
       membership_ptr = membership.data_ptr();
     }

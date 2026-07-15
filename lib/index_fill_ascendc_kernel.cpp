@@ -3,7 +3,7 @@
 namespace {
 
 constexpr uint32_t kMaxDimSize = 4096;
-constexpr uint32_t kMinVectorElements = 256;
+constexpr uint32_t kDim1VectorAlignment = 256;
 constexpr uint32_t kBlockCount = 40;
 constexpr uint32_t kClearElementsPerCore = 128;
 constexpr uint32_t kIndicesPerCore = 8;
@@ -362,10 +362,7 @@ class IndexFillFusedKernel {
     dim_ = dim;
     inplace_ = inplace != 0;
     dim_size_ = dim_ == 0 ? rows_ : cols_;
-    membership_elements_ = AlignUp(dim_size_, 16);
-    if (dim_ == 1 && membership_elements_ < kMinVectorElements) {
-      membership_elements_ = kMinVectorElements;
-    }
+    membership_elements_ = AlignUp(dim_size_, dim_ == 1 ? kDim1VectorAlignment : 16);
     active_builder_cores_ = (index_count_ + kIndicesPerCore - 1) / kIndicesPerCore;
     active_builder_cores_ = active_builder_cores_ < kBlockCount ? active_builder_cores_ : kBlockCount;
     input_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(input), rows_ * cols_);
