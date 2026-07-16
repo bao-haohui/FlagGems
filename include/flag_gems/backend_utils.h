@@ -17,6 +17,7 @@ namespace backend {
 }  // namespace flag_gems
 #elif defined(FLAGGEMS_USE_NPU)
 #include <acl/acl.h>
+#include "torch_npu/csrc/core/npu/NPUFunctions.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 namespace flag_gems {
 namespace backend {
@@ -191,12 +192,18 @@ namespace backend {
     return at::Device(getBackendDeviceType(), static_cast<c10::DeviceIndex>(index));
   }
 
+#if defined(FLAGGEMS_USE_NPU)
+  inline bool isNpuAvailable() noexcept {
+    return c10_npu::device_count() > 0;
+  }
+#endif
+
   // Check if the backend device is available.
   inline bool isDeviceAvailable() {
 #if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
     return torch::cuda::is_available();
 #elif defined(FLAGGEMS_USE_NPU)
-    return torch::custom_class_available("npu");
+    return isNpuAvailable();
 #elif defined(FLAGGEMS_USE_MUSA)
     return true;
 #elif defined(FLAGGEMS_USE_GCU)
