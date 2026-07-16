@@ -60,6 +60,7 @@ if(FLAGGEMS_BACKEND STREQUAL "NPU" AND FLAGGEMS_ASCENDC_AVAILABLE)
       --target index_fill_ascendc_kernel --parallel 1
     DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/ascendc/index_fill/CMakeLists.txt"
+      "${CMAKE_CURRENT_SOURCE_DIR}/index_fill_ascendc_common.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/index_fill_ascendc_kernel.cpp"
     COMMENT "Building the Ascend C index_fill kernel"
     VERBATIM)

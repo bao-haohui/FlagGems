@@ -285,6 +285,30 @@ PYBIND11_MODULE(c_operators, m) {
         c10::Scalar scalar = py_object_to_scalar(value);
         return flag_gems::index_fill_ascendc_scalar_(input, dim, index, scalar);
       });
+  m.def("index_fill_ascendc_capabilities", []() {
+    const auto capabilities = flag_gems::index_fill_ascendc_capabilities();
+    py::dict result;
+    result["device_type"] = "npu";
+    result["supported_dtypes"] = capabilities.supported_dtypes;
+    result["supported_dims"] =
+        std::vector<int64_t>{capabilities.min_dim, capabilities.max_dim};
+    result["max_dim_size"] = capabilities.max_dim_size;
+    result["min_index_len"] = capabilities.min_index_len;
+    result["max_index_len"] = capabilities.max_index_len;
+    result["index_alignment"] = capabilities.index_alignment;
+    result["index_dtype"] = "int64";
+    result["requires_contiguous"] = true;
+    return result;
+  });
+  m.def(
+      "index_fill_ascendc_debug_path",
+      [](const at::Tensor &input, int64_t dim, const at::Tensor &index, bool inplace) {
+        return flag_gems::index_fill_ascendc_debug_path(input, dim, index, inplace);
+      },
+      py::arg("input"),
+      py::arg("dim"),
+      py::arg("index"),
+      py::arg("inplace"));
 #endif
   m.def("fp8_matmul",
         &flag_gems::fp8_matmul,

@@ -6,29 +6,19 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
-#include <limits>
 
 #include "aclrtlaunch_flag_gems_index_fill_fused_2d.h"
 #include "flag_gems/operators.h"
+#include "index_fill_ascendc_common.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 namespace flag_gems {
 namespace {
 
-  constexpr int64_t kMaxDimSize = 4096;
-  constexpr int64_t kDim1VectorAlignment = 256;
-  constexpr int64_t kMaxIndexCount = 4096;
-  constexpr int64_t kIndexAlignment = 8;
-  constexpr int64_t kColumnAlignment = 16;
-  constexpr int64_t kMaxDim0InplaceSmallIndexCount = 256;
-  constexpr int64_t kMaxDim0FunctionalSmallIndexCount = 256;
-  constexpr uint32_t kBlockDim = 40;
-  constexpr uint32_t kGeneralPath = 0;
-  constexpr uint32_t kDim0InplaceSmallPath = 1;
-  constexpr uint32_t kDim0InplaceSmallDeduplicatePath = 2;
-  constexpr uint32_t kDim0FunctionalSmallDirectPath = 3;
-  constexpr uint32_t kDim0FunctionalSmallMembershipPath = 4;
+  using index_fill_ascendc::IndexFillDtype;
+  using index_fill_ascendc::IndexFillPath;
+  using namespace index_fill_ascendc;
 
   bool check_index_bounds(const at::Tensor &index, int64_t dim_size, aclrtStream stream, bool check_unique) {
     std::array<int64_t, kMaxIndexCount> host_index;
@@ -63,9 +53,10 @@ namespace {
                     input.scalar_type() == at::kFloat,
                 "Ascend C index_fill fast path requires float16, bfloat16, or float32 input");
     TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) > 0 &&
-                    input.numel() <= std::numeric_limits<uint32_t>::max(),
+                    input.numel() <= kMaxTensorNumel,
                 "Ascend C index_fill fast path received an unsupported input shape");
-    TORCH_CHECK((dim == 0 || dim == 1) && input.size(dim) <= kMaxDimSize,
+    TORCH_CHECK(dim >= kMinSupportedDim && dim <= kMaxSupportedDim &&
+                    input.size(dim) <= kMaxDimSize,
                 "Ascend C index_fill fast path received an unsupported dimension");
     TORCH_CHECK(index.scalar_type() == at::kLong && index.numel() >= kIndexAlignment &&
                     index.numel() <= kMaxIndexCount && index.numel() % kIndexAlignment == 0,
@@ -75,25 +66,85 @@ namespace {
     TORCH_CHECK(input.device() == index.device(), "input and index must be on the same device");
   }
 
+  struct IndexFillLaunchPlan {
+    IndexFillPath path;
+    uint32_t block_dim;
+  };
+
+  IndexFillLaunchPlan select_index_fill_launch_plan(const at::Tensor &input,
+                                                     int64_t dim,
+                                                     const at::Tensor &index,
+                                                     aclrtStream stream,
+                                                     bool inplace) {
+    const int64_t dim_size = input.size(dim);
+    const bool dim0_inplace_small_candidate =
+        dim == 0 && inplace && index.numel() <= kMaxDim0InplaceSmallIndexCount;
+    const bool use_dim0_functional_small =
+        dim == 0 && !inplace && index.numel() <= kMaxDim0FunctionalSmallIndexCount;
+    const bool all_unique =
+        check_index_bounds(index, dim_size, stream, dim0_inplace_small_candidate);
+
+    if (dim0_inplace_small_candidate && (all_unique || index.numel() == kIndexAlignment)) {
+      return {
+          all_unique ? IndexFillPath::kDim0InplaceSmall
+                     : IndexFillPath::kDim0InplaceSmallDeduplicate,
+          all_unique ? std::min<uint32_t>(index.numel() / kIndexAlignment, kBlockCount) : 1,
+      };
+    }
+    if (use_dim0_functional_small) {
+      return {
+          index.numel() <= 16 ? IndexFillPath::kDim0FunctionalSmallDirectMatch
+                              : IndexFillPath::kDim0FunctionalSmallMembership,
+          std::min<uint32_t>(input.size(0), kBlockCount),
+      };
+    }
+    return {IndexFillPath::kGeneral, kBlockCount};
+  }
+
+  IndexFillDtype get_index_fill_dtype(const at::Tensor &input) {
+    switch (input.scalar_type()) {
+      case at::kHalf:
+        return IndexFillDtype::kFloat16;
+      case at::kBFloat16:
+        return IndexFillDtype::kBFloat16;
+      case at::kFloat:
+        return IndexFillDtype::kFloat32;
+      default:
+        TORCH_CHECK(false, "unsupported Ascend C index_fill dtype");
+        return IndexFillDtype::kFloat16;
+    }
+  }
+
+  const char *index_fill_path_name(IndexFillPath path) {
+    switch (path) {
+      case IndexFillPath::kGeneral:
+        return "general";
+      case IndexFillPath::kDim0InplaceSmall:
+        return "dim0_inplace_small";
+      case IndexFillPath::kDim0InplaceSmallDeduplicate:
+        return "dim0_inplace_deduplicate";
+      case IndexFillPath::kDim0FunctionalSmallDirectMatch:
+        return "dim0_functional_direct";
+      case IndexFillPath::kDim0FunctionalSmallMembership:
+        return "dim0_functional_membership";
+    }
+    TORCH_CHECK(false, "unsupported Ascend C index_fill path");
+    return "unknown";
+  }
+
   void launch_index_fill(const at::Tensor &input,
                          int64_t dim,
                          const at::Tensor &index,
                          at::Tensor &output,
                          const c10::Scalar &value,
                          bool inplace) {
-    const int64_t dim_size = input.size(dim);
     c10::DeviceGuard guard(input.device());
     auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
-    const bool dim0_inplace_small_candidate =
-        dim == 0 && inplace && index.numel() <= kMaxDim0InplaceSmallIndexCount;
-    const bool use_dim0_functional_small =
-        dim == 0 && !inplace && index.numel() <= kMaxDim0FunctionalSmallIndexCount;
-    const bool all_unique = check_index_bounds(index, dim_size, stream, dim0_inplace_small_candidate);
-    const bool use_dim0_inplace_small =
-        dim0_inplace_small_candidate && (all_unique || index.numel() == kIndexAlignment);
+    const auto launch_plan = select_index_fill_launch_plan(input, dim, index, stream, inplace);
     at::Tensor membership;
     void *membership_ptr = nullptr;
-    if (!use_dim0_inplace_small && !use_dim0_functional_small) {
+    if (launch_plan.path == IndexFillPath::kGeneral) {
+      const int64_t dim_size = input.size(dim);
       const int64_t membership_alignment = dim == 1 ? kDim1VectorAlignment : kColumnAlignment;
       const int64_t membership_elements =
           (dim_size + membership_alignment - 1) / membership_alignment * membership_alignment;
@@ -107,30 +158,8 @@ namespace {
     const uint32_t index_count = index.numel();
     const uint32_t kernel_dim = dim;
     const uint32_t kernel_inplace = inplace ? 1 : 0;
-    uint32_t path_code = kGeneralPath;
-    uint32_t block_dim = kBlockDim;
-    if (use_dim0_inplace_small) {
-      path_code = all_unique ? kDim0InplaceSmallPath : kDim0InplaceSmallDeduplicatePath;
-      block_dim = all_unique ? std::min<uint32_t>(index_count / kIndexAlignment, kBlockDim) : 1;
-    } else if (use_dim0_functional_small) {
-      path_code = index_count <= 16 ? kDim0FunctionalSmallDirectPath : kDim0FunctionalSmallMembershipPath;
-      block_dim = std::min<uint32_t>(rows, kBlockDim);
-    }
-
-    uint32_t dtype_code = 0;
-    switch (input.scalar_type()) {
-      case at::kHalf:
-        dtype_code = 0;
-        break;
-      case at::kBFloat16:
-        dtype_code = 1;
-        break;
-      case at::kFloat:
-        dtype_code = 2;
-        break;
-      default:
-        TORCH_CHECK(false, "unsupported Ascend C index_fill dtype");
-    }
+    const uint32_t dtype_code = static_cast<uint32_t>(get_index_fill_dtype(input));
+    const uint32_t path_code = static_cast<uint32_t>(launch_plan.path);
 
     auto launch = [stream,
                    input_ptr = const_cast<void *>(input.data_ptr()),
@@ -146,7 +175,7 @@ namespace {
                    kernel_dim,
                    kernel_inplace,
                    path_code,
-                   block_dim]() -> int {
+                   block_dim = launch_plan.block_dim]() -> int {
       ACLRT_LAUNCH_KERNEL(flag_gems_index_fill_fused_2d)(block_dim,
                                                          stream,
                                                          input_ptr,
@@ -166,9 +195,31 @@ namespace {
       return 0;
     };
     at_npu::native::OpCommand::RunOpApi("flag_gems_index_fill_fused_2d", launch);
-  }
+}
 
 }  // namespace
+
+IndexFillAscendcCapabilities index_fill_ascendc_capabilities() {
+  return {
+      {"float16", "bfloat16", "float32"},
+      kMaxDimSize,
+      kMinIndexCount,
+      kMaxIndexCount,
+      kIndexAlignment,
+      kMinSupportedDim,
+      kMaxSupportedDim,
+  };
+}
+
+std::string index_fill_ascendc_debug_path(const at::Tensor &input,
+                                          int64_t dim,
+                                          const at::Tensor &index,
+                                          bool inplace) {
+  check_fast_path_args(input, dim, index);
+  c10::DeviceGuard guard(input.device());
+  auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
+  return index_fill_path_name(select_index_fill_launch_plan(input, dim, index, stream, inplace).path);
+}
 
 at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
                                      int64_t dim,

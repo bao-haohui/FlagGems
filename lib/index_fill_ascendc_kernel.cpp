@@ -1,18 +1,15 @@
 #include "kernel_operator.h"
+#include "index_fill_ascendc_common.h"
 
 namespace {
 
-constexpr uint32_t kMaxDimSize = 4096;
-constexpr uint32_t kDim1VectorAlignment = 256;
-constexpr uint32_t kBlockCount = 40;
+using flag_gems::index_fill_ascendc::IndexFillDtype;
+using flag_gems::index_fill_ascendc::IndexFillPath;
+using namespace flag_gems::index_fill_ascendc;
+
 constexpr uint32_t kClearElementsPerCore = 128;
 constexpr uint32_t kIndicesPerCore = 8;
 constexpr uint32_t kBufferNum = 2;
-constexpr uint32_t kMaxDim0FunctionalSmallIndexCount = 256;
-constexpr uint32_t kGeneralPath = 0;
-constexpr uint32_t kDim0InplaceSmallDeduplicatePath = 2;
-constexpr uint32_t kDim0FunctionalSmallDirectPath = 3;
-constexpr uint32_t kDim0FunctionalSmallMembershipPath = 4;
 
 __aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
@@ -610,8 +607,9 @@ __aicore__ inline void RunIndexFill(GM_ADDR input,
                                     uint32_t inplace,
                                     uint32_t path_code,
                                     uint32_t block_count) {
-  if (path_code == kDim0FunctionalSmallDirectPath ||
-      path_code == kDim0FunctionalSmallMembershipPath) {
+  const auto path = static_cast<IndexFillPath>(path_code);
+  if (path == IndexFillPath::kDim0FunctionalSmallDirectMatch ||
+      path == IndexFillPath::kDim0FunctionalSmallMembership) {
     IndexFillDim0FunctionalSmallKernel<T> kernel;
     kernel.Init(input,
                 index,
@@ -622,11 +620,12 @@ __aicore__ inline void RunIndexFill(GM_ADDR input,
                 cols,
                 index_count,
                 block_count,
-                path_code == kDim0FunctionalSmallDirectPath);
+                path == IndexFillPath::kDim0FunctionalSmallDirectMatch);
     kernel.Process();
     return;
   }
-  if (path_code != kGeneralPath) {
+  if (path == IndexFillPath::kDim0InplaceSmall ||
+      path == IndexFillPath::kDim0InplaceSmallDeduplicate) {
     IndexFillDim0InplaceSmallKernel<T> kernel;
     kernel.Init(index,
                 output,
@@ -636,8 +635,11 @@ __aicore__ inline void RunIndexFill(GM_ADDR input,
                 cols,
                 index_count,
                 block_count,
-                path_code == kDim0InplaceSmallDeduplicatePath);
+                path == IndexFillPath::kDim0InplaceSmallDeduplicate);
     kernel.Process();
+    return;
+  }
+  if (path != IndexFillPath::kGeneral) {
     return;
   }
   IndexFillFusedKernel<T> kernel;
@@ -672,13 +674,14 @@ extern "C" __global__ __aicore__ void flag_gems_index_fill_fused_2d(GM_ADDR inpu
                                                                     uint32_t path_code,
                                                                     uint32_t block_count) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-  if (dtype_code == 0) {
+  const auto dtype = static_cast<IndexFillDtype>(dtype_code);
+  if (dtype == IndexFillDtype::kFloat16) {
     RunIndexFill<half>(input, index, output, membership, value, value_bits, rows,
                        cols, index_count, dim, inplace, path_code, block_count);
-  } else if (dtype_code == 1) {
+  } else if (dtype == IndexFillDtype::kBFloat16) {
     RunIndexFill<bfloat16_t>(input, index, output, membership, value, value_bits,
                              rows, cols, index_count, dim, inplace, path_code, block_count);
-  } else if (dtype_code == 2) {
+  } else if (dtype == IndexFillDtype::kFloat32) {
     RunIndexFill<float>(input, index, output, membership, value, value_bits, rows,
                         cols, index_count, dim, inplace, path_code, block_count);
   }

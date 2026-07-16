@@ -21,7 +21,6 @@ from .ascend_index_fill_reference import index_fill_ as aclnn_index_fill_
 from .test_index_fill import (
     INDEX_FILL_DTYPES,
     _base_inputs,
-    _dim0_case_variant,
     _scalar_value,
 )
 
@@ -122,8 +121,12 @@ def _selected_implementation(inp, dim, index, value, is_inplace):
     if plan.implementation != index_fill_module.INDEX_FILL_ASCENDC:
         return plan.implementation
 
-    variant = _dim0_case_variant(inp.shape, dim, index.numel())
-    return f"ascendc_dim0_{variant}" if variant else "ascendc_general"
+    from flag_gems.config import c_operators
+
+    debug_path = getattr(c_operators, "index_fill_ascendc_debug_path", None)
+    if debug_path is None:
+        return INDEX_FILL_ASCENDC
+    return f"{INDEX_FILL_ASCENDC}_{debug_path(inp, dim, index, is_inplace)}"
 
 
 def _print_header(op_name, samples):
