@@ -282,6 +282,12 @@ std::string index_fill_ascendc_debug_path(const at::Tensor &input,
                                           int64_t dim,
                                           const at::Tensor &index,
                                           bool inplace);
+at::Tensor index_fill_ascendc_benchmark_scalar(const at::Tensor &input,
+                                                int64_t dim,
+                                                const at::Tensor &index,
+                                                const c10::Scalar &value,
+                                                bool inplace,
+                                                const std::string &path);
 at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
                                      int64_t dim,
                                      const at::Tensor &index,

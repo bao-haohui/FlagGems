@@ -309,6 +309,24 @@ PYBIND11_MODULE(c_operators, m) {
       py::arg("dim"),
       py::arg("index"),
       py::arg("inplace"));
+  m.def(
+      "index_fill_ascendc_benchmark_scalar",
+      [](const at::Tensor &input,
+         int64_t dim,
+         const at::Tensor &index,
+         const py::object &value,
+         bool inplace,
+         const std::string &path) {
+        c10::Scalar scalar = py_object_to_scalar(value);
+        return flag_gems::index_fill_ascendc_benchmark_scalar(
+            input, dim, index, scalar, inplace, path);
+      },
+      py::arg("input"),
+      py::arg("dim"),
+      py::arg("index"),
+      py::arg("value"),
+      py::arg("inplace"),
+      py::arg("path"));
 #endif
   m.def("fp8_matmul",
         &flag_gems::fp8_matmul,

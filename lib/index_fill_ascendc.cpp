@@ -132,15 +132,60 @@ namespace {
     return "unknown";
   }
 
+  IndexFillPath index_fill_path_from_name(const std::string &name) {
+    if (name == "general") {
+      return IndexFillPath::kGeneral;
+    }
+    if (name == "dim0_inplace_small") {
+      return IndexFillPath::kDim0InplaceSmall;
+    }
+    if (name == "dim0_inplace_deduplicate") {
+      return IndexFillPath::kDim0InplaceSmallDeduplicate;
+    }
+    if (name == "dim0_functional_direct") {
+      return IndexFillPath::kDim0FunctionalSmallDirectMatch;
+    }
+    if (name == "dim0_functional_membership") {
+      return IndexFillPath::kDim0FunctionalSmallMembership;
+    }
+    TORCH_CHECK(false, "unknown Ascend C index_fill benchmark path: ", name);
+    return IndexFillPath::kGeneral;
+  }
+
+  IndexFillLaunchPlan select_benchmark_launch_plan(
+      const at::Tensor &input,
+      int64_t dim,
+      const at::Tensor &index,
+      aclrtStream stream,
+      bool inplace,
+      const std::string &path) {
+    const auto selected = select_index_fill_launch_plan(input, dim, index, stream, inplace);
+    if (path == "auto") {
+      return selected;
+    }
+    const auto requested = index_fill_path_from_name(path);
+    if (requested == IndexFillPath::kGeneral) {
+      return {IndexFillPath::kGeneral, kBlockCount};
+    }
+    TORCH_CHECK(requested == selected.path,
+                "Ascend C index_fill benchmark path is not eligible for this input: ",
+                path);
+    return selected;
+  }
+
   void launch_index_fill(const at::Tensor &input,
                          int64_t dim,
                          const at::Tensor &index,
                          at::Tensor &output,
                          const c10::Scalar &value,
-                         bool inplace) {
+                         bool inplace,
+                         const std::string *benchmark_path = nullptr) {
     c10::DeviceGuard guard(input.device());
     auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
-    const auto launch_plan = select_index_fill_launch_plan(input, dim, index, stream, inplace);
+    const auto launch_plan = benchmark_path == nullptr
+        ? select_index_fill_launch_plan(input, dim, index, stream, inplace)
+        : select_benchmark_launch_plan(
+              input, dim, index, stream, inplace, *benchmark_path);
     at::Tensor membership;
     void *membership_ptr = nullptr;
     if (launch_plan.path == IndexFillPath::kGeneral) {
@@ -219,6 +264,18 @@ std::string index_fill_ascendc_debug_path(const at::Tensor &input,
   c10::DeviceGuard guard(input.device());
   auto stream = c10_npu::getCurrentNPUStream(input.get_device()).stream(true);
   return index_fill_path_name(select_index_fill_launch_plan(input, dim, index, stream, inplace).path);
+}
+
+at::Tensor index_fill_ascendc_benchmark_scalar(const at::Tensor &input,
+                                                int64_t dim,
+                                                const at::Tensor &index,
+                                                const c10::Scalar &value,
+                                                bool inplace,
+                                                const std::string &path) {
+  check_fast_path_args(input, dim, index);
+  at::Tensor output = inplace ? input : at::empty_like(input);
+  launch_index_fill(input, dim, index, output, value, inplace, &path);
+  return output;
 }
 
 at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
