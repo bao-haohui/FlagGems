@@ -120,13 +120,7 @@ def _selected_implementation(inp, dim, index, value, is_inplace):
     )
     if plan.implementation != index_fill_module.INDEX_FILL_ASCENDC:
         return plan.implementation
-
-    from flag_gems.config import c_operators
-
-    debug_path = getattr(c_operators, "index_fill_ascendc_debug_path", None)
-    if debug_path is None:
-        return INDEX_FILL_ASCENDC
-    return f"{INDEX_FILL_ASCENDC}_{debug_path(inp, dim, index, is_inplace)}"
+    return INDEX_FILL_ASCENDC
 
 
 def _print_header(op_name, samples):

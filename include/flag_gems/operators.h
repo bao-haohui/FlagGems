@@ -266,43 +266,7 @@ at::Tensor &index_fill_scalar_(at::Tensor &input,
                                int64_t dim,
                                const at::Tensor &index,
                                const c10::Scalar &value);
-#if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
-at::Tensor index_fill_scalar_benchmark(const at::Tensor &input,
-                                       int64_t dim,
-                                       const at::Tensor &index,
-                                       const c10::Scalar &value,
-                                       const std::string &variant);
-at::Tensor &index_fill_scalar_benchmark_(at::Tensor &input,
-                                         int64_t dim,
-                                         const at::Tensor &index,
-                                         const c10::Scalar &value,
-                                         const std::string &variant);
-std::string index_fill_scalar_debug_path(const at::Tensor &input,
-                                         int64_t dim,
-                                         const at::Tensor &index);
-#endif
 #if defined(FLAGGEMS_USE_NPU) && defined(FLAGGEMS_USE_ASCENDC)
-struct IndexFillAscendcCapabilities {
-  std::vector<std::string> supported_dtypes;
-  int64_t max_dim_size;
-  int64_t min_index_len;
-  int64_t max_index_len;
-  int64_t index_alignment;
-  int64_t min_dim;
-  int64_t max_dim;
-};
-
-IndexFillAscendcCapabilities index_fill_ascendc_capabilities();
-std::string index_fill_ascendc_debug_path(const at::Tensor &input,
-                                          int64_t dim,
-                                          const at::Tensor &index,
-                                          bool inplace);
-at::Tensor index_fill_ascendc_benchmark_scalar(const at::Tensor &input,
-                                                int64_t dim,
-                                                const at::Tensor &index,
-                                                const c10::Scalar &value,
-                                                bool inplace,
-                                                const std::string &path);
 at::Tensor index_fill_ascendc_scalar(const at::Tensor &input,
                                      int64_t dim,
                                      const at::Tensor &index,
