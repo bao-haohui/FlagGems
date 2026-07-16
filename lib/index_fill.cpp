@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <limits>
+#include <string>
 
 #include "flag_gems/backend_utils.h"
 #include "flag_gems/operators.h"
@@ -33,12 +34,30 @@ int64_t normalize_dim(int64_t dim, int64_t ndim) {
   return dim;
 }
 
+enum class IndexFillLauncherVariant {
+  kAuto,
+  kGeneral,
+  kSmallInner,
+};
+
+IndexFillLauncherVariant index_fill_launcher_variant_from_name(
+    const std::string& name) {
+  if (name == "auto") return IndexFillLauncherVariant::kAuto;
+  if (name == "general") return IndexFillLauncherVariant::kGeneral;
+  if (name == "small_inner") return IndexFillLauncherVariant::kSmallInner;
+  TORCH_CHECK(false, "unknown index_fill benchmark variant: ", name);
+  return IndexFillLauncherVariant::kAuto;
+}
+
 }  // namespace
 
-at::Tensor& index_fill_scalar_(at::Tensor& input,
-                              int64_t dim,
-                              const at::Tensor& index,
-                              const c10::Scalar& value) {
+namespace {
+
+at::Tensor& launch_index_fill_scalar_(at::Tensor& input,
+                                      int64_t dim,
+                                      const at::Tensor& index,
+                                      const c10::Scalar& value,
+                                      IndexFillLauncherVariant variant) {
   TORCH_CHECK_INDEX(input.dim() > 0,
                     "index_fill expects self to have at least one dimension");
   dim = normalize_dim(dim, input.dim());
@@ -67,12 +86,18 @@ at::Tensor& index_fill_scalar_(at::Tensor& input,
   const bool prefer_generic_small_inner =
       inner_size <= 4 && outer_size > 1 && dim_size > 8192 &&
       index_len > dim_size / 16;
+  const bool small_inner_eligible =
+      outer_size > 1 && inner_size > 1 && inner_size <= 4;
+  TORCH_CHECK(
+      variant == IndexFillLauncherVariant::kAuto || small_inner_eligible,
+      "index_fill benchmark variant requires outer_size > 1 and inner_size in [2, 4]");
 
   c10::DeviceGuard guard(input.device());
   backend::StreamType stream = backend::getCurrentStream();
   backend::RawStreamType raw_stream = backend::getRawStream(stream);
 
-  if (outer_size == 1 && inner_size == 1) {
+  if (variant == IndexFillLauncherVariant::kAuto && outer_size == 1 &&
+      inner_size == 1) {
     constexpr int64_t BLOCK = 512;
     const unsigned int grid_x =
         static_cast<unsigned int>((index_len + BLOCK - 1) / BLOCK);
@@ -97,7 +122,8 @@ at::Tensor& index_fill_scalar_(at::Tensor& input,
     return input;
   }
 
-  if (outer_size > 1 && inner_size == 1) {
+  if (variant == IndexFillLauncherVariant::kAuto && outer_size > 1 &&
+      inner_size == 1) {
     const int64_t block_m = index_len <= 16 ? 512 : 1024;
     const unsigned int grid_x =
         static_cast<unsigned int>(
@@ -129,7 +155,8 @@ at::Tensor& index_fill_scalar_(at::Tensor& input,
       input.scalar_type() == at::kBFloat16 ||
       input.scalar_type() == at::kFloat;
   const int64_t int32_max = std::numeric_limits<int32_t>::max();
-  if (outer_size > 1 && inner_size == 3 && !prefer_generic_small_inner &&
+  if (variant == IndexFillLauncherVariant::kAuto && outer_size > 1 &&
+      inner_size == 3 && !prefer_generic_small_inner &&
       inner3_element_dtype &&
       input.numel() <= int32_max && index_len <= int32_max &&
       index_len <= int32_max / 3 && dim_size <= int32_max &&
@@ -160,8 +187,9 @@ at::Tensor& index_fill_scalar_(at::Tensor& input,
     return input;
   }
 
-  if (outer_size > 1 && inner_size > 1 && inner_size <= 4 &&
-      !prefer_generic_small_inner) {
+  if (variant == IndexFillLauncherVariant::kSmallInner ||
+      (variant == IndexFillLauncherVariant::kAuto && small_inner_eligible &&
+       !prefer_generic_small_inner)) {
     constexpr int64_t BLOCK_M = 256;
     const unsigned int grid_x =
         static_cast<unsigned int>((outer_index_len + BLOCK_M - 1) / BLOCK_M);
@@ -250,6 +278,38 @@ at::Tensor& index_fill_scalar_(at::Tensor& input,
 
   return input;
 }
+
+}  // namespace
+
+at::Tensor& index_fill_scalar_(at::Tensor& input,
+                              int64_t dim,
+                              const at::Tensor& index,
+                              const c10::Scalar& value) {
+  return launch_index_fill_scalar_(
+      input, dim, index, value, IndexFillLauncherVariant::kAuto);
+}
+
+#if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
+at::Tensor index_fill_scalar_benchmark(const at::Tensor& input,
+                                       int64_t dim,
+                                       const at::Tensor& index,
+                                       const c10::Scalar& value,
+                                       const std::string& variant) {
+  at::Tensor output = input.clone();
+  launch_index_fill_scalar_(
+      output, dim, index, value, index_fill_launcher_variant_from_name(variant));
+  return output;
+}
+
+at::Tensor& index_fill_scalar_benchmark_(at::Tensor& input,
+                                         int64_t dim,
+                                         const at::Tensor& index,
+                                         const c10::Scalar& value,
+                                         const std::string& variant) {
+  return launch_index_fill_scalar_(
+      input, dim, index, value, index_fill_launcher_variant_from_name(variant));
+}
+#endif
 
 at::Tensor index_fill_scalar(const at::Tensor& input,
                              int64_t dim,

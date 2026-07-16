@@ -264,6 +264,30 @@ PYBIND11_MODULE(c_operators, m) {
       });
   m.def("index_fill_scalar", &index_fill_scalar_dispatch);
   m.def("index_fill_scalar_", &index_fill_scalar_dispatch_);
+#if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
+  m.def(
+      "index_fill_scalar_benchmark",
+      [](const at::Tensor &input,
+         int64_t dim,
+         const at::Tensor &index,
+         py::object value,
+         const std::string &variant) {
+        c10::Scalar scalar = py_object_to_scalar(value);
+        return flag_gems::index_fill_scalar_benchmark(
+            input, dim, index, scalar, variant);
+      });
+  m.def(
+      "index_fill_scalar_benchmark_",
+      [](at::Tensor &input,
+         int64_t dim,
+         const at::Tensor &index,
+         py::object value,
+         const std::string &variant) -> at::Tensor & {
+        c10::Scalar scalar = py_object_to_scalar(value);
+        return flag_gems::index_fill_scalar_benchmark_(
+            input, dim, index, scalar, variant);
+      });
+#endif
 #if defined(FLAGGEMS_USE_CUDA)
   py::class_<IndexFillAtenRegistration>(m, "IndexFillAtenRegistration")
       .def(py::init<>());

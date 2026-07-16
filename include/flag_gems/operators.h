@@ -266,6 +266,18 @@ at::Tensor &index_fill_scalar_(at::Tensor &input,
                                int64_t dim,
                                const at::Tensor &index,
                                const c10::Scalar &value);
+#if defined(FLAGGEMS_USE_CUDA) || defined(FLAGGEMS_USE_IX)
+at::Tensor index_fill_scalar_benchmark(const at::Tensor &input,
+                                       int64_t dim,
+                                       const at::Tensor &index,
+                                       const c10::Scalar &value,
+                                       const std::string &variant);
+at::Tensor &index_fill_scalar_benchmark_(at::Tensor &input,
+                                         int64_t dim,
+                                         const at::Tensor &index,
+                                         const c10::Scalar &value,
+                                         const std::string &variant);
+#endif
 #if defined(FLAGGEMS_USE_NPU) && defined(FLAGGEMS_USE_ASCENDC)
 struct IndexFillAscendcCapabilities {
   std::vector<std::string> supported_dtypes;
