@@ -932,6 +932,36 @@ def test_index_fill_ascendc_capabilities_match_python_plan(monkeypatch):
         )
 
 
+@pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "cuda", reason="CUDA C++ launcher path is CUDA-only"
+)
+def test_index_fill_cuda_small_inner_path_selection():
+    from flag_gems.config import c_operators
+
+    if c_operators is None or not hasattr(
+        c_operators, "index_fill_scalar_debug_path"
+    ):
+        pytest.skip("FlagGems was built without the CUDA index_fill launcher")
+
+    index = torch.arange(16, dtype=torch.long, device=flag_gems.device)
+    input_inner2 = torch.empty(
+        (64, 4096, 2), dtype=torch.float16, device=flag_gems.device
+    )
+    input_inner4 = torch.empty(
+        (64, 4096, 4), dtype=torch.float16, device=flag_gems.device
+    )
+
+    assert (
+        c_operators.index_fill_scalar_debug_path(input_inner2, 1, index)
+        == "small_inner_flat"
+    )
+    assert (
+        c_operators.index_fill_scalar_debug_path(input_inner4, 1, index)
+        == "general"
+    )
+
+
 @pytest.mark.index_fill_out
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)
 def test_index_fill_scalar_out(dtype):

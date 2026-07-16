@@ -277,6 +277,9 @@ at::Tensor &index_fill_scalar_benchmark_(at::Tensor &input,
                                          const at::Tensor &index,
                                          const c10::Scalar &value,
                                          const std::string &variant);
+std::string index_fill_scalar_debug_path(const at::Tensor &input,
+                                         int64_t dim,
+                                         const at::Tensor &index);
 #endif
 #if defined(FLAGGEMS_USE_NPU) && defined(FLAGGEMS_USE_ASCENDC)
 struct IndexFillAscendcCapabilities {

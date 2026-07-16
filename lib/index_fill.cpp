@@ -49,6 +49,15 @@ IndexFillLauncherVariant index_fill_launcher_variant_from_name(
   return IndexFillLauncherVariant::kAuto;
 }
 
+bool use_small_inner_flat(IndexFillLauncherVariant variant,
+                          int64_t outer_size,
+                          int64_t inner_size,
+                          bool prefer_generic_small_inner) {
+  return variant == IndexFillLauncherVariant::kSmallInner ||
+      (variant == IndexFillLauncherVariant::kAuto && outer_size > 1 &&
+       inner_size == 2 && !prefer_generic_small_inner);
+}
+
 }  // namespace
 
 namespace {
@@ -187,9 +196,8 @@ at::Tensor& launch_index_fill_scalar_(at::Tensor& input,
     return input;
   }
 
-  if (variant == IndexFillLauncherVariant::kSmallInner ||
-      (variant == IndexFillLauncherVariant::kAuto && small_inner_eligible &&
-       !prefer_generic_small_inner)) {
+  if (use_small_inner_flat(
+          variant, outer_size, inner_size, prefer_generic_small_inner)) {
     constexpr int64_t BLOCK_M = 256;
     const unsigned int grid_x =
         static_cast<unsigned int>((outer_index_len + BLOCK_M - 1) / BLOCK_M);
@@ -308,6 +316,48 @@ at::Tensor& index_fill_scalar_benchmark_(at::Tensor& input,
                                          const std::string& variant) {
   return launch_index_fill_scalar_(
       input, dim, index, value, index_fill_launcher_variant_from_name(variant));
+}
+
+std::string index_fill_scalar_debug_path(const at::Tensor& input,
+                                         int64_t dim,
+                                         const at::Tensor& index) {
+  TORCH_CHECK_INDEX(input.dim() > 0,
+                    "index_fill expects self to have at least one dimension");
+  dim = normalize_dim(dim, input.dim());
+  TORCH_CHECK_INDEX(dim >= 0 && dim < input.dim(),
+                    "index_fill: dim out of range");
+  TORCH_CHECK_INDEX(index.scalar_type() == at::kLong,
+                    "index_fill_(): Expected dtype int64 for index.");
+
+  const int64_t index_len = index.numel();
+  if (input.numel() == 0 || index_len == 0) return "empty";
+
+  const int64_t dim_size = input.size(dim);
+  const int64_t inner_size = product_after_dim(input, dim);
+  const int64_t outer_size = product_before_dim(input, dim);
+  const bool prefer_generic_small_inner =
+      inner_size <= 4 && outer_size > 1 && dim_size > 8192 &&
+      index_len > dim_size / 16;
+  if (outer_size == 1 && inner_size == 1) return "one_dim";
+  if (outer_size > 1 && inner_size == 1) return "inner1";
+
+  const bool inner3_element_dtype =
+      input.scalar_type() == at::kHalf ||
+      input.scalar_type() == at::kBFloat16 ||
+      input.scalar_type() == at::kFloat;
+  const int64_t int32_max = std::numeric_limits<int32_t>::max();
+  if (outer_size > 1 && inner_size == 3 && !prefer_generic_small_inner &&
+      inner3_element_dtype && input.numel() <= int32_max &&
+      index_len <= int32_max && index_len <= int32_max / 3 &&
+      dim_size <= int32_max && outer_size <= int32_max) {
+    return "inner3_element";
+  }
+  return use_small_inner_flat(IndexFillLauncherVariant::kAuto,
+                              outer_size,
+                              inner_size,
+                              prefer_generic_small_inner)
+      ? "small_inner_flat"
+      : "general";
 }
 #endif
 

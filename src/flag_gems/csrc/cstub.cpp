@@ -287,6 +287,11 @@ PYBIND11_MODULE(c_operators, m) {
         return flag_gems::index_fill_scalar_benchmark_(
             input, dim, index, scalar, variant);
       });
+  m.def("index_fill_scalar_debug_path",
+        &flag_gems::index_fill_scalar_debug_path,
+        py::arg("input"),
+        py::arg("dim"),
+        py::arg("index"));
 #endif
 #if defined(FLAGGEMS_USE_CUDA)
   py::class_<IndexFillAtenRegistration>(m, "IndexFillAtenRegistration")
