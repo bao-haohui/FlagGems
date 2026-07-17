@@ -344,37 +344,6 @@ def index_fill_contiguous_dim0_rows_kernel(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["row_count", "row_width"])
-def index_fill_contiguous_dim0_rows_copy_kernel(
-    inp,
-    out,
-    membership,
-    value,
-    row_count,
-    row_width,
-    VALUE_IS_TENSOR: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    row_id = ext.program_id(axis=0)
-    row_mask = row_id < row_count
-    selected = tl.load(membership + row_id, mask=row_mask, other=0) > 0
-
-    if VALUE_IS_TENSOR:
-        value_scalar = tl.load(value)
-    else:
-        value_scalar = value
-
-    row_offset = row_id.to(tl.int64) * row_width.to(tl.int64)
-    for column_start in range(0, row_width, BLOCK_N):
-        columns = column_start + tl.arange(0, BLOCK_N)
-        mask = row_mask & (columns < row_width)
-        original = tl.load(inp + row_offset + columns, mask=mask, other=0)
-        fill_values = tl.full([BLOCK_N], value_scalar, dtype=original.dtype)
-        result = tl.where(selected, fill_values, original)
-        tl.store(out + row_offset + columns, result, mask=mask)
-
-
-@libentry()
 @triton.jit(
     do_not_specialize=["outer_size", "dim_size"]
 )
@@ -833,22 +802,10 @@ def _index_fill_contiguous_dim0_rows(
 def _index_fill_contiguous_dim0_rows_functional(
     inp, index, value, value_is_tensor, has_negative
 ):
-    out = torch.empty_like(inp)
-    membership = _build_contiguous_membership_mask(
-        out, index, has_negative, out.size(0)
+    out = _native_clone(inp)
+    return _index_fill_contiguous_dim0_rows(
+        out, index, value, value_is_tensor, has_negative
     )
-    with torch_device_fn.device(out.device):
-        index_fill_contiguous_dim0_rows_copy_kernel[(out.size(0),)](
-            inp,
-            out,
-            membership,
-            value,
-            out.size(0),
-            out.size(1),
-            VALUE_IS_TENSOR=value_is_tensor,
-            BLOCK_N=1024,
-        )
-    return out
 
 
 def _index_fill_contiguous_membership_mask(
