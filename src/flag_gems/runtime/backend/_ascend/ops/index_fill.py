@@ -788,11 +788,12 @@ def _can_use_contiguous_dim0_rows(out, dim, index, bounds_checked):
 def _can_use_contiguous_small_inner_updates(
     out, dim, index, value_is_tensor, bounds_checked
 ):
+    index_len = index.numel()
     if (
         not bounds_checked
         or value_is_tensor
         or not out.is_contiguous()
-        or index.numel() < 32
+        or (index_len != 1 and index_len < 32)
         or out.numel() > 2**31 - 1
     ):
         return False

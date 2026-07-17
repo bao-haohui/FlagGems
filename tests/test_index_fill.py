@@ -317,6 +317,28 @@ def test_index_fill_small_inner_blocked_updates(dtype):
     utils.gems_assert_equal(inplace, ref_out)
 
 
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("index_value", (0, -1))
+def test_index_fill_single_index_small_inner_updates(dtype, index_value):
+    inp = _make_input((32, 64), dtype)
+    index = torch.tensor([index_value], dtype=torch.long, device=flag_gems.device)
+    value = _scalar_value(dtype)
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_out = ref_inp.index_fill(1, ref_index, value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+        inplace = inp.clone()
+        inplace.index_fill_(1, index, value)
+
+    utils.gems_assert_equal(actual, ref_out)
+    utils.gems_assert_equal(inplace, ref_out)
+
+
 @pytest.mark.index_fill_out
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)
 def test_index_fill_scalar_out(dtype):
