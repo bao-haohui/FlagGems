@@ -652,7 +652,7 @@ _strided_index_fill = _AscendStridedIndexFillFunction()
 
 
 def _check_ascend_index_bounds(index, dim_size):
-    if index.numel() <= 256:
+    if index.numel() <= 512:
         # A single small D2H copy avoids a device reduction and two scalar transfers.
         min_index, max_index = torch.aminmax(index.cpu())
     else:
