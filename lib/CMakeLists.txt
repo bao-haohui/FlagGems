@@ -74,35 +74,6 @@ target_compile_definitions(operators PRIVATE BACKEND_${FLAGGEMS_BACKEND})
 add_library(FlagGems::operators ALIAS operators)
 
 
-# Dedicated NPU extension for the index_fill dim=0 C++ TritonJIT fast path.
-# It deliberately does not link against the broad operators library, so unrelated
-# C++ operators cannot block this optional fast path.
-if(FLAGGEMS_BACKEND STREQUAL "NPU")
-  pybind11_add_module(_index_fill_npu_launcher index_fill_npu_launcher.cpp)
-  target_link_npu_libraries(_index_fill_npu_launcher)
-  target_include_directories(_index_fill_npu_launcher PRIVATE "${PROJECT_SOURCE_DIR}/include")
-  target_link_libraries(_index_fill_npu_launcher
-    PRIVATE Torch::Torch_Python TritonJIT::triton_jit)
-  target_compile_definitions(_index_fill_npu_launcher PRIVATE
-    FLAGGEMS_USE_NPU
-    BACKEND_NPU
-  )
-  set_target_properties(_index_fill_npu_launcher PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    INSTALL_RPATH "${_rpath_portable_origin}/${CMAKE_INSTALL_LIBDIR}")
-  target_compile_options(_index_fill_npu_launcher PRIVATE -std=c++20)
-
-  if(FLAGGEMS_INSTALL)
-    install(
-      FILES
-        "${PROJECT_SOURCE_DIR}/src/flag_gems/runtime/backend/_ascend/kernels/__init__.py"
-        "${PROJECT_SOURCE_DIR}/src/flag_gems/runtime/backend/_ascend/kernels/index_fill_dim0_npu.py"
-      DESTINATION "runtime/backend/_ascend/kernels")
-    install(TARGETS _index_fill_npu_launcher LIBRARY DESTINATION ".")
-  endif()
-
-endif()
 # ==============================================================================
 # Pointwise dynamic C++ support (experimental feature, disabled by default)
 # ==============================================================================

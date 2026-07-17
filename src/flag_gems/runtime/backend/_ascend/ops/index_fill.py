@@ -17,8 +17,6 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
 
-from .index_fill_dispatch import try_cpp_index_fill
-
 logger = logging.getLogger(__name__)
 
 @libentry()
@@ -1095,12 +1093,6 @@ def _index_fill_functional(
 
 def index_fill_scalar(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL SCALAR")
-    cpp_out = try_cpp_index_fill(
-        inp, dim, index, value, inplace=False,
-        fallback=lambda: None,
-    )
-    if cpp_out is not None:
-        return cpp_out
     dim, index, bounds_checked, has_negative = _prepare_ascend_index(
         inp, dim, index
     )
@@ -1149,12 +1141,6 @@ def index_fill_tensor_out(inp, dim, index, value, *, out):
 
 def index_fill_scalar_(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL_ SCALAR")
-    cpp_out = try_cpp_index_fill(
-        inp, dim, index, value, inplace=True,
-        fallback=lambda: None,
-    )
-    if cpp_out is not None:
-        return cpp_out
     dim, index, bounds_checked, has_negative = _prepare_ascend_index(
         inp, dim, index
     )
