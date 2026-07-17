@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from typing import Any, Callable, Mapping, Tuple
 
@@ -717,14 +718,18 @@ def _should_use_fused_membership_build(dim_size, index_len):
 
 
 def _can_use_contiguous_dim0_rows(out, dim, index, bounds_checked):
-    return (
-        bounds_checked
-        and out.is_contiguous()
-        and out.ndim == 2
-        and dim == 0
-        and index.numel() > 0
-        and out.numel() <= 2**31 - 1
-    )
+    if (
+        not bounds_checked
+        or not out.is_contiguous()
+        or index.numel() == 0
+        or out.numel() > 2**31 - 1
+    ):
+        return False
+
+    dim_size = out.size(dim)
+    inner_size = math.prod(out.shape[dim + 1 :])
+    outer_size = out.numel() // (dim_size * inner_size)
+    return outer_size == 1
 
 
 def _can_use_contiguous_membership_mask(out, dim, index, bounds_checked):
@@ -778,8 +783,10 @@ def _build_contiguous_membership_mask(out, index, has_negative, dim_size):
 
 
 def _index_fill_contiguous_dim0_rows(
-    out, index, value, value_is_tensor, has_negative
+    out, dim, index, value, value_is_tensor, has_negative
 ):
+    dim_size = out.size(dim)
+    inner_size = math.prod(out.shape[dim + 1 :])
     grid = (index.numel(),)
     with torch_device_fn.device(out.device):
         index_fill_contiguous_dim0_rows_kernel[grid](
@@ -787,10 +794,10 @@ def _index_fill_contiguous_dim0_rows(
             index,
             value,
             index.numel(),
-            out.size(0),
-            out.size(1),
+            dim_size,
+            inner_size,
             HAS_NEGATIVE=has_negative,
-            USE_INT32=_use_int32_indexing(out, out.size(0), index.numel()),
+            USE_INT32=_use_int32_indexing(out, dim_size, index.numel()),
             VALUE_IS_TENSOR=value_is_tensor,
             BLOCK_N=4096,
         )
@@ -798,11 +805,11 @@ def _index_fill_contiguous_dim0_rows(
 
 
 def _index_fill_contiguous_dim0_rows_functional(
-    inp, index, value, value_is_tensor, has_negative
+    inp, dim, index, value, value_is_tensor, has_negative
 ):
     out = _native_clone(inp)
     return _index_fill_contiguous_dim0_rows(
-        out, index, value, value_is_tensor, has_negative
+        out, dim, index, value, value_is_tensor, has_negative
     )
 
 
@@ -948,7 +955,7 @@ def _index_fill_contiguous(
     outer_size = out.numel() // (dim_size * inner_size)
     if _can_use_contiguous_dim0_rows(out, dim, index, bounds_checked):
         return _index_fill_contiguous_dim0_rows(
-            out, index, value, value_is_tensor, has_negative
+            out, dim, index, value, value_is_tensor, has_negative
         )
     if _should_use_contiguous_membership_mask(
         out, index, bounds_checked, outer_size, inner_size
@@ -1058,7 +1065,7 @@ def _index_fill_functional(
 ):
     if _can_use_contiguous_dim0_rows(inp, dim, index, bounds_checked):
         return _index_fill_contiguous_dim0_rows_functional(
-            inp, index, value, value_is_tensor, has_negative
+            inp, dim, index, value, value_is_tensor, has_negative
         )
     if _can_use_contiguous_membership_mask(inp, dim, index, bounds_checked):
         out = torch.empty_like(inp)

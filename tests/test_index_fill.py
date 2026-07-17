@@ -262,10 +262,11 @@ def test_index_fill_large_contiguous_membership_duplicate_index():
 
 @pytest.mark.index_fill
 @pytest.mark.index_fill_
+@pytest.mark.parametrize("shape", ((64, 257), (32, 17, 3)))
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("value_is_tensor", (False, True))
-def test_index_fill_dim0_row_path_negative_duplicate(dtype, value_is_tensor):
-    inp = _make_input((64, 257), dtype)
+def test_index_fill_dim0_row_path_negative_duplicate(shape, dtype, value_is_tensor):
+    inp = _make_input(shape, dtype)
     index = torch.tensor([0, 7, 7, -1, 31], dtype=torch.long, device=flag_gems.device)
     value = (
         torch.tensor(-3.5, dtype=dtype, device=flag_gems.device)
