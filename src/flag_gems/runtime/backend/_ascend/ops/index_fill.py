@@ -801,7 +801,11 @@ def _can_use_contiguous_small_inner_updates(
     dim_size = out.size(dim)
     inner_size = math.prod(out.shape[dim + 1 :])
     outer_size = out.numel() // (dim_size * inner_size)
-    return outer_size > 1 and inner_size <= 4
+    return (
+        outer_size > 1
+        and inner_size <= 4
+        and (index_len == 1 or (inner_size > 1 and index_len >= 32))
+    )
 
 
 def _index_fill_contiguous_small_inner_updates(
