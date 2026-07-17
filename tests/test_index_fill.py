@@ -16,7 +16,17 @@ INDEX_FILL_SHAPES = (
 )
 DIM_LIST = [1] if QUICK_MODE else [0, -1]
 INDEX_CASES = ["normal", "negative", "scalar"]
-INDEX_FILL_DTYPES = utils.FLOAT_DTYPES + utils.INT_DTYPES + utils.BOOL_TYPES
+_INDEX_FILL_DTYPES = utils.FLOAT_DTYPES + utils.INT_DTYPES + utils.BOOL_TYPES
+INDEX_FILL_DTYPES = [
+    pytest.param(
+        dtype,
+        marks=pytest.mark.skipif(
+            flag_gems.device == "npu" and dtype == torch.int16,
+            reason="torch_npu/ACLNN does not support int16 index_fill reference",
+        ),
+    )
+    for dtype in _INDEX_FILL_DTYPES
+]
 INDEX_FILL_OPS = [
     "index_fill_scalar",
     "index_fill_scalar_",
@@ -245,6 +255,33 @@ def test_index_fill_large_contiguous_membership_duplicate_index():
         actual = inp.index_fill(1, index, value)
         inplace = inp.clone()
         inplace.index_fill_(1, index, value)
+
+    utils.gems_assert_equal(actual, ref_out)
+    utils.gems_assert_equal(inplace, ref_out)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("value_is_tensor", (False, True))
+def test_index_fill_dim0_row_path_negative_duplicate(dtype, value_is_tensor):
+    inp = _make_input((64, 257), dtype)
+    index = torch.tensor([0, 7, 7, -1, 31], dtype=torch.long, device=flag_gems.device)
+    value = (
+        torch.tensor(-3.5, dtype=dtype, device=flag_gems.device)
+        if value_is_tensor
+        else -3.5
+    )
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_value = _to_ref_value(value)
+    ref_out = ref_inp.index_fill(0, ref_index, ref_value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(0, index, value)
+        inplace = inp.clone()
+        inplace.index_fill_(0, index, value)
 
     utils.gems_assert_equal(actual, ref_out)
     utils.gems_assert_equal(inplace, ref_out)
