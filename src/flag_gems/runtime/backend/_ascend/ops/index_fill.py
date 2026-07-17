@@ -69,6 +69,59 @@ def index_fill_contiguous_scalar_kernel(
 @libentry()
 @triton.jit(
     do_not_specialize=[
+        "value",
+        "outer_size",
+        "index_len",
+        "dim_size",
+        "inner_size",
+    ]
+)
+def index_fill_contiguous_scalar_small_inner_kernel(
+    out,
+    index,
+    value,
+    outer_size,
+    index_len,
+    dim_size,
+    inner_size,
+    HAS_NEGATIVE: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_OUTER: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_index = ext.program_id(axis=0)
+    pid_outer = ext.program_id(axis=1)
+    index_offsets = pid_index * BLOCK_I + tl.arange(0, BLOCK_I)
+    index_mask = index_offsets < index_len
+    inner_offsets = tl.arange(0, BLOCK_N)
+
+    dim_size_i32 = dim_size.to(tl.int32)
+    inner_size_i32 = inner_size.to(tl.int32)
+    index_values = tl.load(index + index_offsets, mask=index_mask, other=0).to(
+        tl.int32
+    )
+    if HAS_NEGATIVE:
+        index_values = tl.where(
+            index_values < 0, index_values + dim_size_i32, index_values
+        )
+
+    for outer_offset in range(0, BLOCK_OUTER):
+        outer_index = pid_outer * BLOCK_OUTER + outer_offset
+        outer_mask = outer_index < outer_size
+        out_offsets = outer_index.to(tl.int32) * dim_size_i32 * inner_size_i32
+        out_offsets += index_values[:, None] * inner_size_i32
+        out_offsets += inner_offsets[None, :]
+        store_mask = (
+            outer_mask
+            & index_mask[:, None]
+            & (inner_offsets[None, :] < inner_size_i32)
+        )
+        tl.store(out + out_offsets, value, mask=store_mask)
+
+
+@libentry()
+@triton.jit(
+    do_not_specialize=[
         "outer_index_len",
         "index_len",
         "dim_size",
@@ -732,6 +785,52 @@ def _can_use_contiguous_dim0_rows(out, dim, index, bounds_checked):
     return outer_size == 1
 
 
+def _can_use_contiguous_small_inner_updates(
+    out, dim, index, value_is_tensor, bounds_checked
+):
+    if (
+        not bounds_checked
+        or value_is_tensor
+        or not out.is_contiguous()
+        or index.numel() < 32
+        or out.numel() > 2**31 - 1
+    ):
+        return False
+
+    dim_size = out.size(dim)
+    inner_size = math.prod(out.shape[dim + 1 :])
+    outer_size = out.numel() // (dim_size * inner_size)
+    return outer_size > 1 and inner_size <= 4
+
+
+def _index_fill_contiguous_small_inner_updates(
+    out, dim, index, value, has_negative
+):
+    dim_size = out.size(dim)
+    inner_size = math.prod(out.shape[dim + 1 :])
+    outer_size = out.numel() // (dim_size * inner_size)
+    block_i = 16
+    block_outer = 8
+    block_n = 4
+    grid = (triton.cdiv(index.numel(), block_i), triton.cdiv(outer_size, block_outer))
+
+    with torch_device_fn.device(out.device):
+        index_fill_contiguous_scalar_small_inner_kernel[grid](
+            out,
+            index,
+            value,
+            outer_size,
+            index.numel(),
+            dim_size,
+            inner_size,
+            HAS_NEGATIVE=has_negative,
+            BLOCK_I=block_i,
+            BLOCK_OUTER=block_outer,
+            BLOCK_N=block_n,
+        )
+    return out
+
+
 def _can_use_contiguous_membership_mask(out, dim, index, bounds_checked):
     if not out.is_contiguous():
         return False
@@ -956,6 +1055,12 @@ def _index_fill_contiguous(
     if _can_use_contiguous_dim0_rows(out, dim, index, bounds_checked):
         return _index_fill_contiguous_dim0_rows(
             out, dim, index, value, value_is_tensor, has_negative
+        )
+    if _can_use_contiguous_small_inner_updates(
+        out, dim, index, value_is_tensor, bounds_checked
+    ):
+        return _index_fill_contiguous_small_inner_updates(
+            out, dim, index, value, has_negative
         )
     if _should_use_contiguous_membership_mask(
         out, index, bounds_checked, outer_size, inner_size
