@@ -704,8 +704,15 @@ class _AscendStridedIndexFillFunction:
 _strided_index_fill = _AscendStridedIndexFillFunction()
 
 
+_ASCEND_INDEX_HOST_CHECK_MAX_BYTES = 32 * 1024
+
+
+def _should_use_ascend_host_index_check(index):
+    return index.numel() * index.element_size() <= _ASCEND_INDEX_HOST_CHECK_MAX_BYTES
+
+
 def _check_ascend_index_bounds(index, dim_size):
-    if index.numel() <= 512:
+    if _should_use_ascend_host_index_check(index):
         # A single small D2H copy avoids a device reduction and two scalar transfers.
         min_index, max_index = torch.aminmax(index.cpu())
     else:

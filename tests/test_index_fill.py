@@ -76,6 +76,27 @@ def _to_ref_value(value):
 
 
 @pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend bounds-check dispatch is only used on NPU",
+)
+@pytest.mark.parametrize(
+    ("index_numel", "expected_host_check"),
+    ((512, True), (2048, True), (4096, True), (8192, False)),
+)
+def test_index_fill_ascend_host_bounds_check_threshold(
+    index_numel, expected_host_check
+):
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    index = torch.empty(index_numel, dtype=torch.long, device=flag_gems.device)
+    assert (
+        ascend_index_fill._should_use_ascend_host_index_check(index)
+        is expected_host_check
+    )
+
+
+@pytest.mark.index_fill
 @pytest.mark.parametrize("shape", INDEX_FILL_SHAPES)
 @pytest.mark.parametrize("dim", DIM_LIST)
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)
