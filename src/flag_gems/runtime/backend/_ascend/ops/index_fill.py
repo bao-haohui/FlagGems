@@ -816,6 +816,29 @@ def _can_use_contiguous_small_inner_updates(
     )
 
 
+def _can_use_contiguous_high_density_transpose_fill(
+    out, dim, index, value_is_tensor, bounds_checked
+):
+    if (
+        not bounds_checked
+        or value_is_tensor
+        or not out.is_contiguous()
+        or out.numel() > 2**31 - 1
+    ):
+        return False
+
+    dim_size = out.size(dim)
+    inner_size = math.prod(out.shape[dim + 1 :])
+    outer_size = out.numel() // (dim_size * inner_size)
+    return (
+        dim_size >= 4096
+        and outer_size > 1
+        and 2 <= inner_size <= 4
+        and outer_size * inner_size >= 256
+        and index.numel() * 2 >= dim_size - 1
+    )
+
+
 def _index_fill_contiguous_small_inner_updates(
     out, dim, index, value, has_negative
 ):
@@ -923,6 +946,30 @@ def _index_fill_contiguous_dim0_rows_functional(
     return _index_fill_contiguous_dim0_rows(
         out, dim, index, value, value_is_tensor, has_negative
     )
+
+
+def _index_fill_contiguous_high_density_transpose_fill(
+    inp, dim, index, value, value_is_tensor, has_negative, inplace
+):
+    dim_size = inp.size(dim)
+    inner_size = math.prod(inp.shape[dim + 1 :])
+    outer_size = inp.numel() // (dim_size * inner_size)
+
+    # Materialize [dim, outer, inner] so each selected dim value is one
+    # contiguous row rather than outer_size disjoint small-inner writes.
+    transposed = (
+        inp.reshape(outer_size, dim_size, inner_size)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    _index_fill_contiguous_dim0_rows(
+        transposed, 0, index, value, value_is_tensor, has_negative
+    )
+    restored = transposed.permute(1, 0, 2).reshape_as(inp)
+    if inplace:
+        inp.copy_(restored)
+        return inp
+    return restored.contiguous()
 
 
 def _index_fill_contiguous_membership_mask(
@@ -1069,6 +1116,12 @@ def _index_fill_contiguous(
         return _index_fill_contiguous_dim0_rows(
             out, dim, index, value, value_is_tensor, has_negative
         )
+    if _can_use_contiguous_high_density_transpose_fill(
+        out, dim, index, value_is_tensor, bounds_checked
+    ):
+        return _index_fill_contiguous_high_density_transpose_fill(
+            out, dim, index, value, value_is_tensor, has_negative, inplace=True
+        )
     if _can_use_contiguous_small_inner_updates(
         out, dim, index, value_is_tensor, bounds_checked
     ):
@@ -1184,6 +1237,12 @@ def _index_fill_functional(
     if _can_use_contiguous_dim0_rows(inp, dim, index, bounds_checked):
         return _index_fill_contiguous_dim0_rows_functional(
             inp, dim, index, value, value_is_tensor, has_negative
+        )
+    if _can_use_contiguous_high_density_transpose_fill(
+        inp, dim, index, value_is_tensor, bounds_checked
+    ):
+        return _index_fill_contiguous_high_density_transpose_fill(
+            inp, dim, index, value, value_is_tensor, has_negative, inplace=False
         )
     if _can_use_contiguous_membership_mask(inp, dim, index, bounds_checked):
         out = torch.empty_like(inp)
