@@ -97,6 +97,30 @@ def test_index_fill_ascend_host_bounds_check_threshold(
 
 
 @pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend transpose-fill dispatch is only used on NPU",
+)
+@pytest.mark.parametrize(
+    ("index_numel", "expected_transpose_fill"),
+    ((512, False), (1024, True)),
+)
+def test_index_fill_ascend_transpose_fill_program_threshold(
+    index_numel, expected_transpose_fill
+):
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    inp = torch.empty((200, 40999, 3), dtype=torch.float16, device=flag_gems.device)
+    index = torch.empty(index_numel, dtype=torch.long, device=flag_gems.device)
+    assert (
+        ascend_index_fill._can_use_contiguous_high_density_transpose_fill(
+            inp, 1, index, value_is_tensor=False, bounds_checked=True
+        )
+        is expected_transpose_fill
+    )
+
+
+@pytest.mark.index_fill
 @pytest.mark.parametrize("shape", INDEX_FILL_SHAPES)
 @pytest.mark.parametrize("dim", DIM_LIST)
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)

@@ -22,6 +22,12 @@ from flag_gems.utils.code_utils import IndentedBuffer, write_atomic
 
 logger = logging.getLogger(__name__)
 
+_SMALL_INNER_BLOCK_I = 16
+_SMALL_INNER_BLOCK_OUTER = 8
+_SMALL_INNER_BLOCK_N = 4
+# Avoid scatter-like small-inner updates once their two-dimensional grid is large.
+_TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS = 1600
+
 @libentry()
 @triton.jit(
     do_not_specialize=[
@@ -830,12 +836,18 @@ def _can_use_contiguous_high_density_transpose_fill(
     dim_size = out.size(dim)
     inner_size = math.prod(out.shape[dim + 1 :])
     outer_size = out.numel() // (dim_size * inner_size)
+    estimated_sparse_programs = math.ceil(
+        index.numel() / _SMALL_INNER_BLOCK_I
+    ) * math.ceil(outer_size / _SMALL_INNER_BLOCK_OUTER)
     return (
         dim_size >= 4096
         and outer_size > 1
         and 2 <= inner_size <= 4
         and outer_size * inner_size >= 256
-        and index.numel() * 2 >= dim_size - 1
+        and (
+            index.numel() * 2 >= dim_size - 1
+            or estimated_sparse_programs >= _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS
+        )
     )
 
 
@@ -845,9 +857,9 @@ def _index_fill_contiguous_small_inner_updates(
     dim_size = out.size(dim)
     inner_size = math.prod(out.shape[dim + 1 :])
     outer_size = out.numel() // (dim_size * inner_size)
-    block_i = 16
-    block_outer = 8
-    block_n = 4
+    block_i = _SMALL_INNER_BLOCK_I
+    block_outer = _SMALL_INNER_BLOCK_OUTER
+    block_n = _SMALL_INNER_BLOCK_N
     grid = (triton.cdiv(index.numel(), block_i), triton.cdiv(outer_size, block_outer))
 
     with torch_device_fn.device(out.device):
