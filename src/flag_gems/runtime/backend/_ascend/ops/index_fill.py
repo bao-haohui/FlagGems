@@ -842,11 +842,14 @@ def _can_use_contiguous_high_density_transpose_fill(
     return (
         dim_size >= 4096
         and outer_size > 1
-        and 2 <= inner_size <= 4
+        and 1 <= inner_size <= 4
         and outer_size * inner_size >= 256
         and (
             index.numel() * 2 >= dim_size - 1
-            or estimated_sparse_programs >= _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS
+            or (
+                inner_size > 1
+                and estimated_sparse_programs >= _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS
+            )
         )
     )
 
