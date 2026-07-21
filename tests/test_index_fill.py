@@ -147,6 +147,32 @@ def test_index_fill_ascend_transpose_fill_high_density_inner1(
 
 
 @pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend transpose-fill dispatch is only used on NPU",
+)
+@pytest.mark.parametrize(
+    ("index_numel", "expected_transpose_fill"),
+    ((128, False), (256, True)),
+)
+def test_index_fill_ascend_transpose_fill_small_full_dim(
+    index_numel, expected_transpose_fill
+):
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    inp = torch.empty(
+        (4096, 256), dtype=torch.float16, device=flag_gems.device
+    )
+    index = torch.empty(index_numel, dtype=torch.long, device=flag_gems.device)
+    assert (
+        ascend_index_fill._can_use_contiguous_high_density_transpose_fill(
+            inp, 1, index, value_is_tensor=False, bounds_checked=True
+        )
+        is expected_transpose_fill
+    )
+
+
+@pytest.mark.index_fill
 @pytest.mark.parametrize("shape", INDEX_FILL_SHAPES)
 @pytest.mark.parametrize("dim", DIM_LIST)
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)
@@ -295,6 +321,38 @@ def test_index_fill_high_density_inner1_transpose_path(dtype):
         (
             torch.tensor([-1, -1], dtype=torch.long, device=flag_gems.device),
             torch.arange(2046, dtype=torch.long, device=flag_gems.device),
+        )
+    )
+    value = _scalar_value(dtype)
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_out = ref_inp.index_fill(1, ref_index, value)
+
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        actual = inp.index_fill(1, index, value)
+        inplace = inp.clone()
+        result = inplace.index_fill_(1, index, value)
+
+    assert actual is not inp
+    assert result is inplace
+    utils.gems_assert_equal(actual, ref_out)
+    utils.gems_assert_equal(inplace, ref_out)
+
+
+@pytest.mark.index_fill
+@pytest.mark.index_fill_
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend small full-dim transpose fill is only used on NPU",
+)
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_index_fill_small_full_dim_transpose_path(dtype):
+    inp = _make_input((4096, 256), dtype)
+    index = torch.cat(
+        (
+            torch.tensor([-1, -1], dtype=torch.long, device=flag_gems.device),
+            torch.arange(254, dtype=torch.long, device=flag_gems.device),
         )
     )
     value = _scalar_value(dtype)

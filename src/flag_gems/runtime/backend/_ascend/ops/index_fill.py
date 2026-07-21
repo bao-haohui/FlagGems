@@ -27,6 +27,8 @@ _SMALL_INNER_BLOCK_OUTER = 8
 _SMALL_INNER_BLOCK_N = 4
 # Avoid scatter-like small-inner updates once their two-dimensional grid is large.
 _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS = 1600
+_TRANSPOSE_FILL_SMALL_FULL_DIM_MAX_SIZE = 256
+_TRANSPOSE_FILL_SMALL_FULL_DIM_MIN_NUMEL = 1024 * 1024
 
 @libentry()
 @triton.jit(
@@ -839,15 +841,22 @@ def _can_use_contiguous_high_density_transpose_fill(
     estimated_sparse_programs = math.ceil(
         index.numel() / _SMALL_INNER_BLOCK_I
     ) * math.ceil(outer_size / _SMALL_INNER_BLOCK_OUTER)
+    is_wide_dense = dim_size >= 4096 and index.numel() * 2 >= dim_size - 1
+    is_small_full_dim = (
+        dim_size <= _TRANSPOSE_FILL_SMALL_FULL_DIM_MAX_SIZE
+        and out.numel() >= _TRANSPOSE_FILL_SMALL_FULL_DIM_MIN_NUMEL
+        and index.numel() >= dim_size
+    )
     return (
-        dim_size >= 4096
-        and outer_size > 1
+        outer_size > 1
         and 1 <= inner_size <= 4
         and outer_size * inner_size >= 256
         and (
-            index.numel() * 2 >= dim_size - 1
+            is_wide_dense
+            or is_small_full_dim
             or (
-                inner_size > 1
+                dim_size >= 4096
+                and inner_size > 1
                 and estimated_sparse_programs >= _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS
             )
         )
