@@ -131,6 +131,61 @@ def index_fill_contiguous_scalar_small_inner_kernel(
 @libentry()
 @triton.jit(
     do_not_specialize=[
+        "value",
+        "outer_size",
+        "dim_size",
+        "inner_size",
+    ]
+)
+def index_fill_contiguous_scalar_small_inner_blockptr_kernel(
+    out,
+    index,
+    value,
+    outer_size,
+    dim_size,
+    inner_size,
+    HAS_NEGATIVE: tl.constexpr,
+    BLOCK_OUTER: tl.constexpr,
+    SPAN: tl.constexpr,
+):
+    pid_index = ext.program_id(axis=0)
+    pid_outer = ext.program_id(axis=1)
+
+    dim_size_i32 = dim_size.to(tl.int32)
+    inner_size_i32 = inner_size.to(tl.int32)
+    raw_index = tl.load(index + pid_index).to(tl.int32)
+    valid_index = (raw_index >= -dim_size_i32) & (raw_index < dim_size_i32)
+    index_value = raw_index
+    if HAS_NEGATIVE:
+        index_value = tl.where(
+            index_value < 0, index_value + dim_size_i32, index_value
+        )
+
+    # Block pointers cannot accept a mask. Skip invalid indices and map the
+    # final outer tail to row zero, which has already received the same value.
+    if valid_index:
+        for outer_offset in range(0, BLOCK_OUTER):
+            outer_index = pid_outer * BLOCK_OUTER + outer_offset
+            safe_outer_index = tl.where(
+                outer_index < outer_size, outer_index, 0
+            )
+            base = out + (
+                safe_outer_index.to(tl.int32) * dim_size_i32 + index_value
+            ) * inner_size_i32
+            block = tl.make_block_ptr(
+                base=base,
+                shape=(SPAN,),
+                strides=(1,),
+                offsets=(0,),
+                block_shape=(4,),
+                order=(0,),
+            )
+            values = tl.full((4,), value, out.dtype.element_ty)
+            tl.store(block, values, boundary_check=(0,))
+
+@libentry()
+@triton.jit(
+    do_not_specialize=[
         "outer_index_len",
         "index_len",
         "dim_size",
@@ -869,25 +924,42 @@ def _index_fill_contiguous_small_inner_updates(
     dim_size = out.size(dim)
     inner_size = math.prod(out.shape[dim + 1 :])
     outer_size = out.numel() // (dim_size * inner_size)
-    block_i = _SMALL_INNER_BLOCK_I
     block_outer = _SMALL_INNER_BLOCK_OUTER
-    block_n = _SMALL_INNER_BLOCK_N
-    grid = (triton.cdiv(index.numel(), block_i), triton.cdiv(outer_size, block_outer))
 
     with torch_device_fn.device(out.device):
-        index_fill_contiguous_scalar_small_inner_kernel[grid](
-            out,
-            index,
-            value,
-            outer_size,
-            index.numel(),
-            dim_size,
-            inner_size,
-            HAS_NEGATIVE=has_negative,
-            BLOCK_I=block_i,
-            BLOCK_OUTER=block_outer,
-            BLOCK_N=block_n,
-        )
+        if 2 <= inner_size <= 4:
+            grid = (index.numel(), triton.cdiv(outer_size, block_outer))
+            index_fill_contiguous_scalar_small_inner_blockptr_kernel[grid](
+                out,
+                index,
+                value,
+                outer_size,
+                dim_size,
+                inner_size,
+                HAS_NEGATIVE=has_negative,
+                BLOCK_OUTER=block_outer,
+                SPAN=inner_size,
+            )
+        else:
+            block_i = _SMALL_INNER_BLOCK_I
+            block_n = _SMALL_INNER_BLOCK_N
+            grid = (
+                triton.cdiv(index.numel(), block_i),
+                triton.cdiv(outer_size, block_outer),
+            )
+            index_fill_contiguous_scalar_small_inner_kernel[grid](
+                out,
+                index,
+                value,
+                outer_size,
+                index.numel(),
+                dim_size,
+                inner_size,
+                HAS_NEGATIVE=has_negative,
+                BLOCK_I=block_i,
+                BLOCK_OUTER=block_outer,
+                BLOCK_N=block_n,
+            )
     return out
 
 

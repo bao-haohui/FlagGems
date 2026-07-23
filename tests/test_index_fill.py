@@ -453,8 +453,22 @@ def test_index_fill_dim0_row_path_negative_duplicate(shape, dtype, value_is_tens
 @pytest.mark.index_fill
 @pytest.mark.index_fill_
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
-def test_index_fill_small_inner_blocked_updates(dtype):
-    inp = _make_input((32, 64, 3), dtype)
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (32, 64, 2),
+        (9, 37, 2),
+        (5, 37, 2, 1),
+        (32, 64, 3),
+        (9, 37, 3),
+        (5, 37, 3, 1),
+        (32, 64, 4),
+        (9, 37, 4),
+        (5, 37, 2, 2),
+    ),
+)
+def test_index_fill_small_inner_blocked_updates(dtype, shape):
+    inp = _make_input(shape, dtype)
     base_index = torch.arange(30, dtype=torch.long, device=flag_gems.device)
     index = torch.cat(
         (
