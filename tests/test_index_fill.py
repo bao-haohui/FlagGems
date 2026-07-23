@@ -173,6 +173,44 @@ def test_index_fill_ascend_transpose_fill_small_full_dim(
 
 
 @pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend full-coverage fill dispatch is only used on NPU",
+)
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_index_fill_ascend_full_coverage_fill_and_duplicate_fallback(dtype):
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    shape = (16, 64, 3)
+    value = 3.14159
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    index = torch.randperm(shape[1], device=flag_gems.device)
+    index[::7] -= shape[1]
+
+    ref_inp = utils.to_reference(inp, False)
+    ref_index = utils.to_reference(index, False)
+    ref_out = ref_inp.index_fill(1, ref_index, value)
+    actual = ascend_index_fill.index_fill_scalar(inp, 1, index, value)
+    utils.gems_assert_equal(actual, ref_out)
+
+    inplace = inp.clone()
+    ref_inplace = utils.to_reference(inplace, False)
+    ref_inplace.index_fill_(1, ref_index, value)
+    ascend_index_fill.index_fill_scalar_(inplace, 1, index, value)
+    utils.gems_assert_equal(inplace, ref_inplace)
+
+    duplicate = torch.randint(
+        0, shape[1] // 2, (shape[1],), device=flag_gems.device
+    )
+    ref_duplicate = ref_inp.index_fill(
+        1, utils.to_reference(duplicate, False), value
+    )
+    duplicate_actual = ascend_index_fill.index_fill_scalar(
+        inp, 1, duplicate, value
+    )
+    utils.gems_assert_equal(duplicate_actual, ref_duplicate)
+
+@pytest.mark.index_fill
 @pytest.mark.parametrize("shape", INDEX_FILL_SHAPES)
 @pytest.mark.parametrize("dim", DIM_LIST)
 @pytest.mark.parametrize("dtype", INDEX_FILL_DTYPES)

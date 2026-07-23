@@ -4,6 +4,7 @@ import math
 import os
 from typing import Any, Callable, Mapping, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +28,7 @@ _SMALL_INNER_BLOCK_OUTER = 8
 _SMALL_INNER_BLOCK_N = 4
 # Avoid scatter-like small-inner updates once their two-dimensional grid is large.
 _TRANSPOSE_FILL_MIN_SPARSE_PROGRAMS = 1600
+_FULL_COVERAGE_HOST_CHECK_MAX_BYTES = 384 * 1024
 _TRANSPOSE_FILL_SMALL_FULL_DIM_MAX_SIZE = 256
 _TRANSPOSE_FILL_SMALL_FULL_DIM_MIN_NUMEL = 1024 * 1024
 
@@ -182,6 +184,25 @@ def index_fill_contiguous_scalar_small_inner_blockptr_kernel(
             )
             values = tl.full((4,), value, out.dtype.element_ty)
             tl.store(block, values, boundary_check=(0,))
+
+@libentry()
+@triton.jit(do_not_specialize=["N"])
+def index_fill_contiguous_full_kernel(
+    out,
+    value,
+    N,
+    VALUE_IS_TENSOR: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    if VALUE_IS_TENSOR:
+        fill_value = tl.load(value)
+    else:
+        fill_value = value
+    tl.store(out + offsets, fill_value, mask=mask)
+
 
 @libentry()
 @triton.jit(
@@ -1013,6 +1034,53 @@ def _build_contiguous_membership_mask(out, index, has_negative, dim_size):
     return membership
 
 
+def _has_full_contiguous_index_coverage(index, dim_size):
+    host_index = index.cpu().numpy()
+    selected = np.zeros(dim_size, dtype=np.bool_)
+    # Bounds validation makes NumPy's negative indexing exactly match normalization.
+    selected[host_index] = True
+    return bool(selected.all())
+
+
+def _can_try_contiguous_full_coverage_fill(
+    out, dim, index, value_is_tensor, bounds_checked
+):
+    if (
+        not bounds_checked
+        or value_is_tensor
+        or not out.is_contiguous()
+        or index.numel() != out.size(dim)
+        or (
+            index.numel() * index.element_size()
+            > _FULL_COVERAGE_HOST_CHECK_MAX_BYTES
+        )
+        or out.numel() > 2**31 - 1
+    ):
+        return False
+    inner_size = math.prod(out.shape[dim + 1 :])
+    outer_size = out.numel() // (out.size(dim) * inner_size)
+    return outer_size > 1 and 1 <= inner_size <= 4
+
+
+def _try_index_fill_contiguous_full_coverage_fill(
+    inp, dim, index, value, value_is_tensor, inplace
+):
+    dim_size = inp.size(dim)
+    if not _has_full_contiguous_index_coverage(index, dim_size):
+        return None
+
+    out = inp if inplace else torch.empty_like(inp)
+    with torch_device_fn.device(inp.device):
+        index_fill_contiguous_full_kernel[(triton.cdiv(inp.numel(), 4096),)](
+            out,
+            value,
+            inp.numel(),
+            VALUE_IS_TENSOR=value_is_tensor,
+            BLOCK_SIZE=4096,
+        )
+    return out
+
+
 def _index_fill_contiguous_dim0_rows(
     out, dim, index, value, value_is_tensor, has_negative
 ):
@@ -1212,6 +1280,14 @@ def _index_fill_contiguous(
         return _index_fill_contiguous_dim0_rows(
             out, dim, index, value, value_is_tensor, has_negative
         )
+    if _can_try_contiguous_full_coverage_fill(
+        out, dim, index, value_is_tensor, bounds_checked
+    ):
+        full_fill = _try_index_fill_contiguous_full_coverage_fill(
+            out, dim, index, value, value_is_tensor, inplace=True
+        )
+        if full_fill is not None:
+            return full_fill
     if _can_use_contiguous_high_density_transpose_fill(
         out, dim, index, value_is_tensor, bounds_checked
     ):
@@ -1334,6 +1410,14 @@ def _index_fill_functional(
         return _index_fill_contiguous_dim0_rows_functional(
             inp, dim, index, value, value_is_tensor, has_negative
         )
+    if _can_try_contiguous_full_coverage_fill(
+        inp, dim, index, value_is_tensor, bounds_checked
+    ):
+        full_fill = _try_index_fill_contiguous_full_coverage_fill(
+            inp, dim, index, value, value_is_tensor, inplace=False
+        )
+        if full_fill is not None:
+            return full_fill
     if _can_use_contiguous_high_density_transpose_fill(
         inp, dim, index, value_is_tensor, bounds_checked
     ):
