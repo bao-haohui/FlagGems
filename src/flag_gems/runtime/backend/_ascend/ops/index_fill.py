@@ -796,26 +796,29 @@ def _should_use_ascend_host_index_check(index):
 
 
 def _check_ascend_index_bounds(index, dim_size):
+    host_index = None
     if _should_use_ascend_host_index_check(index):
         # A single small D2H copy avoids a device reduction and two scalar transfers.
-        min_index, max_index = torch.aminmax(index.cpu())
+        host_index = index.cpu()
+        min_index, max_index = torch.aminmax(host_index)
     else:
         min_index, max_index = torch.aminmax(index)
     min_index = int(min_index.item())
     max_index = int(max_index.item())
     if min_index < -dim_size or max_index >= dim_size:
         raise IndexError("index out of range in self")
-    return min_index < 0
+    return min_index < 0, host_index
 
 
 def _prepare_ascend_index(inp, dim, index):
     dim, index = _prepare_index(inp, dim, index)
     bounds_checked = False
     has_negative = False
+    host_index = None
     if index.numel() > 0 and _index_fill_uses_device_bounds_check():
-        has_negative = _check_ascend_index_bounds(index, inp.size(dim))
+        has_negative, host_index = _check_ascend_index_bounds(index, inp.size(dim))
         bounds_checked = True
-    return dim, index.contiguous(), bounds_checked, has_negative
+    return dim, index.contiguous(), bounds_checked, has_negative, host_index
 
 
 def _get_contiguous_config(inner_size):
@@ -1034,11 +1037,12 @@ def _build_contiguous_membership_mask(out, index, has_negative, dim_size):
     return membership
 
 
-def _has_full_contiguous_index_coverage(index, dim_size):
-    host_index = index.cpu().numpy()
+def _has_full_contiguous_index_coverage(index, dim_size, host_index=None):
+    if host_index is None:
+        host_index = index.cpu()
     selected = np.zeros(dim_size, dtype=np.bool_)
     # Bounds validation makes NumPy's negative indexing exactly match normalization.
-    selected[host_index] = True
+    selected[host_index.numpy()] = True
     return bool(selected.all())
 
 
@@ -1063,10 +1067,10 @@ def _can_try_contiguous_full_coverage_fill(
 
 
 def _try_index_fill_contiguous_full_coverage_fill(
-    inp, dim, index, value, value_is_tensor, inplace
+    inp, dim, index, value, value_is_tensor, inplace, host_index=None
 ):
     dim_size = inp.size(dim)
-    if not _has_full_contiguous_index_coverage(index, dim_size):
+    if not _has_full_contiguous_index_coverage(index, dim_size, host_index):
         return None
 
     out = inp if inplace else torch.empty_like(inp)
@@ -1270,6 +1274,7 @@ def _index_fill_contiguous(
     value_is_tensor,
     bounds_checked,
     has_negative,
+    host_index=None,
 ):
     dim_size = out.size(dim)
     inner_size = 1
@@ -1284,7 +1289,7 @@ def _index_fill_contiguous(
         out, dim, index, value_is_tensor, bounds_checked
     ):
         full_fill = _try_index_fill_contiguous_full_coverage_fill(
-            out, dim, index, value, value_is_tensor, inplace=True
+            out, dim, index, value, value_is_tensor, inplace=True, host_index=host_index
         )
         if full_fill is not None:
             return full_fill
@@ -1393,18 +1398,26 @@ def _index_fill_impl(
     value_is_tensor,
     bounds_checked,
     has_negative,
+    host_index=None,
 ):
     if out.numel() == 0 or index.numel() == 0:
         return out
     if out.is_contiguous():
         return _index_fill_contiguous(
-            out, dim, index, value, value_is_tensor, bounds_checked, has_negative
+            out,
+            dim,
+            index,
+            value,
+            value_is_tensor,
+            bounds_checked,
+            has_negative,
+            host_index,
         )
     return _index_fill_strided(out, dim, index, value, value_is_tensor)
 
 
 def _index_fill_functional(
-    inp, dim, index, value, value_is_tensor, bounds_checked, has_negative
+    inp, dim, index, value, value_is_tensor, bounds_checked, has_negative, host_index=None
 ):
     if _can_use_contiguous_dim0_rows(inp, dim, index, bounds_checked):
         return _index_fill_contiguous_dim0_rows_functional(
@@ -1414,7 +1427,7 @@ def _index_fill_functional(
         inp, dim, index, value_is_tensor, bounds_checked
     ):
         full_fill = _try_index_fill_contiguous_full_coverage_fill(
-            inp, dim, index, value, value_is_tensor, inplace=False
+            inp, dim, index, value, value_is_tensor, inplace=False, host_index=host_index
         )
         if full_fill is not None:
             return full_fill
@@ -1452,47 +1465,47 @@ def _index_fill_functional(
 
     out = _native_clone(inp)
     return _index_fill_impl(
-        out, dim, index, value, value_is_tensor, bounds_checked, has_negative
+        out, dim, index, value, value_is_tensor, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_scalar(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL SCALAR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     return _index_fill_functional(
-        inp, dim, index, value, False, bounds_checked, has_negative
+        inp, dim, index, value, False, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_tensor(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL TENSOR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     value_is_tensor, value = _prepare_tensor_value(inp, value)
     return _index_fill_functional(
-        inp, dim, index, value, value_is_tensor, bounds_checked, has_negative
+        inp, dim, index, value, value_is_tensor, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_scalar_out(inp, dim, index, value, *, out):
     logger.debug("GEMS_ASCEND INDEX_FILL SCALAR_OUT")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     if tuple(out.shape) != tuple(inp.shape):
         out.resize_(inp.shape)
     out.copy_(inp)
     return _index_fill_impl(
-        out, dim, index, value, False, bounds_checked, has_negative
+        out, dim, index, value, False, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_tensor_out(inp, dim, index, value, *, out):
     logger.debug("GEMS_ASCEND INDEX_FILL TENSOR_OUT")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     value_is_tensor, value = _prepare_tensor_value(inp, value)
@@ -1500,26 +1513,26 @@ def index_fill_tensor_out(inp, dim, index, value, *, out):
         out.resize_(inp.shape)
     out.copy_(inp)
     return _index_fill_impl(
-        out, dim, index, value, value_is_tensor, bounds_checked, has_negative
+        out, dim, index, value, value_is_tensor, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_scalar_(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL_ SCALAR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     return _index_fill_impl(
-        inp, dim, index, value, False, bounds_checked, has_negative
+        inp, dim, index, value, False, bounds_checked, has_negative, host_index
     )
 
 
 def index_fill_tensor_(inp, dim, index, value):
     logger.debug("GEMS_ASCEND INDEX_FILL_ TENSOR")
-    dim, index, bounds_checked, has_negative = _prepare_ascend_index(
+    dim, index, bounds_checked, has_negative, host_index = _prepare_ascend_index(
         inp, dim, index
     )
     value_is_tensor, value = _prepare_tensor_value(inp, value)
     return _index_fill_impl(
-        inp, dim, index, value, value_is_tensor, bounds_checked, has_negative
+        inp, dim, index, value, value_is_tensor, bounds_checked, has_negative, host_index
     )
