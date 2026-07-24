@@ -19,43 +19,54 @@ logger = logging.getLogger(__name__)
 @triton.jit(
     do_not_specialize=[
         "value",
+        "outer_index_len",
         "index_len",
         "dim_size",
         "inner_size",
+        "tiles_per_program",
     ]
 )
 def index_fill_contiguous_kernel(
     out,
     index,
     value,
+    outer_index_len,
     index_len,
     dim_size,
     inner_size,
+    tiles_per_program,
     VALUE_IS_TENSOR: tl.constexpr,
     BLOCK_INNER: tl.constexpr,
 ):
     pid_outer_index = tl.program_id(axis=0)
     pid_inner = tl.program_id(axis=1)
-
-    outer_index = pid_outer_index // index_len
-    index_offset = pid_outer_index - outer_index * index_len
-    raw_index = tl.load(index + index_offset).to(tl.int64)
-    valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
-    tl.device_assert(valid_index, "index out of bounds")
-
-    normalized_index = tl.where(raw_index < 0, raw_index + dim_size, raw_index)
+    program_count = tl.num_programs(axis=0)
 
     inner_offsets = pid_inner * BLOCK_INNER + tl.arange(0, BLOCK_INNER)
-    mask = inner_offsets < inner_size
-    out_offsets = (
-        outer_index.to(tl.int64) * dim_size + normalized_index
-    ) * inner_size + inner_offsets
+    inner_mask = inner_offsets < inner_size
 
     if VALUE_IS_TENSOR:
         fill_value = tl.load(value)
     else:
         fill_value = value
-    tl.store(out + out_offsets, fill_value, mask=mask & valid_index)
+
+    for tile in range(0, tiles_per_program):
+        pair_offset = pid_outer_index + tile * program_count
+        pair_mask = pair_offset < outer_index_len
+        outer_index = pair_offset // index_len
+        index_offset = pair_offset - outer_index * index_len
+        raw_index = tl.load(index + index_offset, mask=pair_mask, other=0).to(tl.int64)
+        valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
+        tl.device_assert(valid_index, "index out of bounds", mask=pair_mask)
+        normalized_index = tl.where(raw_index < 0, raw_index + dim_size, raw_index)
+        out_offsets = (
+            outer_index.to(tl.int64) * dim_size + normalized_index
+        ) * inner_size + inner_offsets
+        tl.store(
+            out + out_offsets,
+            fill_value,
+            mask=pair_mask & valid_index & inner_mask,
+        )
 
 
 def _block_inner(inner_size):
@@ -72,9 +83,16 @@ def _index_fill_contiguous_(out, dim, index, value, value_is_tensor):
         inner_size *= size
     outer_size = out.numel() // (dim_size * inner_size)
     block_inner = _block_inner(inner_size)
+    inner_tiles = triton.cdiv(inner_size, block_inner)
+    outer_index_len = outer_size * index.numel()
+    # HCU uses cooperative launches. Cap the total CTA count and let each CTA
+    # process a grid-stride sequence of (outer, index) pairs.
+    max_programs = 65536
+    grid_outer = min(outer_index_len, max(1, max_programs // inner_tiles))
+    tiles_per_program = triton.cdiv(outer_index_len, grid_outer)
     grid = (
-        outer_size * index.numel(),
-        triton.cdiv(inner_size, block_inner),
+        grid_outer,
+        inner_tiles,
     )
 
     with torch_device_fn.device(out.device):
@@ -82,9 +100,11 @@ def _index_fill_contiguous_(out, dim, index, value, value_is_tensor):
             out,
             index,
             value,
+            outer_index_len,
             index.numel(),
             dim_size,
             inner_size,
+            tiles_per_program,
             VALUE_IS_TENSOR=value_is_tensor,
             BLOCK_INNER=block_inner,
         )
