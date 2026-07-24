@@ -36,9 +36,10 @@ def index_fill_contiguous_kernel(
     inner_size,
     tiles_per_program,
     VALUE_IS_TENSOR: tl.constexpr,
+    BLOCK_PAIRS: tl.constexpr,
     BLOCK_INNER: tl.constexpr,
 ):
-    pid_outer_index = tl.program_id(axis=0)
+    pid_pair_tile = tl.program_id(axis=0)
     pid_inner = tl.program_id(axis=1)
     program_count = tl.num_programs(axis=0)
 
@@ -51,21 +52,25 @@ def index_fill_contiguous_kernel(
         fill_value = value
 
     for tile in range(0, tiles_per_program):
-        pair_offset = pid_outer_index + tile * program_count
-        pair_mask = pair_offset < outer_index_len
-        outer_index = pair_offset // index_len
-        index_offset = pair_offset - outer_index * index_len
+        pair_offsets = (
+            (pid_pair_tile + tile * program_count) * BLOCK_PAIRS
+            + tl.arange(0, BLOCK_PAIRS)
+        )
+        pair_mask = pair_offsets < outer_index_len
+        outer_index = pair_offsets // index_len
+        index_offset = pair_offsets - outer_index * index_len
         raw_index = tl.load(index + index_offset, mask=pair_mask, other=0).to(tl.int64)
         valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
         tl.device_assert(valid_index, "index out of bounds", mask=pair_mask)
         normalized_index = tl.where(raw_index < 0, raw_index + dim_size, raw_index)
         out_offsets = (
-            outer_index.to(tl.int64) * dim_size + normalized_index
-        ) * inner_size + inner_offsets
+            outer_index[:, None].to(tl.int64) * dim_size
+            + normalized_index[:, None]
+        ) * inner_size + inner_offsets[None, :]
         tl.store(
             out + out_offsets,
             fill_value,
-            mask=pair_mask & valid_index & inner_mask,
+            mask=pair_mask[:, None] & valid_index[:, None] & inner_mask[None, :],
         )
 
 
@@ -83,13 +88,15 @@ def _index_fill_contiguous_(out, dim, index, value, value_is_tensor):
         inner_size *= size
     outer_size = out.numel() // (dim_size * inner_size)
     block_inner = _block_inner(inner_size)
+    block_pairs = max(1, 256 // block_inner)
     inner_tiles = triton.cdiv(inner_size, block_inner)
     outer_index_len = outer_size * index.numel()
+    pair_tiles = triton.cdiv(outer_index_len, block_pairs)
     # HCU uses cooperative launches. Cap the total CTA count and let each CTA
-    # process a grid-stride sequence of (outer, index) pairs.
+    # process a grid-stride sequence of vectorized (outer, index) tiles.
     max_programs = 65536
-    grid_outer = min(outer_index_len, max(1, max_programs // inner_tiles))
-    tiles_per_program = triton.cdiv(outer_index_len, grid_outer)
+    grid_outer = min(pair_tiles, max(1, max_programs // inner_tiles))
+    tiles_per_program = triton.cdiv(pair_tiles, grid_outer)
     grid = (
         grid_outer,
         inner_tiles,
@@ -106,6 +113,7 @@ def _index_fill_contiguous_(out, dim, index, value, value_is_tensor):
             inner_size,
             tiles_per_program,
             VALUE_IS_TENSOR=value_is_tensor,
+            BLOCK_PAIRS=block_pairs,
             BLOCK_INNER=block_inner,
         )
     return out
