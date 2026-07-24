@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -13,6 +14,21 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
+
+_HCU_NATIVE_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
+
+
+def _try_hcu_native_index_fill(op_name, *args):
+    if os.environ.get("FLAG_GEMS_HYGON_INDEX_FILL_IMPL", "native").lower() == "triton":
+        return False, None
+
+    import flag_gems
+
+    registrar = getattr(flag_gems, "current_work_registrar", None)
+    native_op = getattr(registrar, "torch_ops_map", {}).get(f"aten::{op_name}")
+    if native_op is None:
+        return False, None
+    return True, native_op.call_boxed(_HCU_NATIVE_KEYSET, *args)
 
 
 @libentry()
@@ -124,6 +140,11 @@ def _index_fill_(out, dim, index, value, value_is_tensor):
 
 def index_fill_scalar(inp, dim, index, value):
     logger.debug("GEMS_HYGON INDEX_FILL SCALAR")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill.int_Scalar", inp, dim, index, value
+    )
+    if used_native:
+        return native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     out = inp.clone(memory_format=torch.preserve_format)
     return _index_fill_(out, dim, index, value, False)
@@ -131,12 +152,22 @@ def index_fill_scalar(inp, dim, index, value):
 
 def index_fill_scalar_(inp, dim, index, value):
     logger.debug("GEMS_HYGON INDEX_FILL_ SCALAR")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill_.int_Scalar", inp, dim, index, value
+    )
+    if used_native:
+        return inp if native_out is None else native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     return _index_fill_(inp, dim, index, value, False)
 
 
 def index_fill_tensor(inp, dim, index, value):
     logger.debug("GEMS_HYGON INDEX_FILL TENSOR")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill.int_Tensor", inp, dim, index, value
+    )
+    if used_native:
+        return native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     value_is_tensor, value = _prepare_tensor_value(inp, value)
     out = inp.clone(memory_format=torch.preserve_format)
@@ -145,6 +176,11 @@ def index_fill_tensor(inp, dim, index, value):
 
 def index_fill_tensor_(inp, dim, index, value):
     logger.debug("GEMS_HYGON INDEX_FILL_ TENSOR")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill_.int_Tensor", inp, dim, index, value
+    )
+    if used_native:
+        return inp if native_out is None else native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     value_is_tensor, value = _prepare_tensor_value(inp, value)
     return _index_fill_(inp, dim, index, value, value_is_tensor)
@@ -152,6 +188,11 @@ def index_fill_tensor_(inp, dim, index, value):
 
 def index_fill_scalar_out(inp, dim, index, value, *, out):
     logger.debug("GEMS_HYGON INDEX_FILL SCALAR_OUT")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill.int_Scalar_out", inp, dim, index, value, out
+    )
+    if used_native:
+        return out if native_out is None else native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     if tuple(out.shape) != tuple(inp.shape):
         out.resize_(inp.shape)
@@ -161,6 +202,11 @@ def index_fill_scalar_out(inp, dim, index, value, *, out):
 
 def index_fill_tensor_out(inp, dim, index, value, *, out):
     logger.debug("GEMS_HYGON INDEX_FILL TENSOR_OUT")
+    used_native, native_out = _try_hcu_native_index_fill(
+        "index_fill.int_Tensor_out", inp, dim, index, value, out
+    )
+    if used_native:
+        return out if native_out is None else native_out
     dim, index = _prepare_hcu_index(inp, dim, index)
     value_is_tensor, value = _prepare_tensor_value(inp, value)
     if tuple(out.shape) != tuple(inp.shape):
