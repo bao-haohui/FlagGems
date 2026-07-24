@@ -113,11 +113,6 @@ def _index_fill_contiguous_(out, dim, index, value, value_is_tensor):
 
 def _prepare_hcu_index(inp, dim, index):
     dim, index = _prepare_index(inp, dim, index)
-    if index.numel() > 0:
-        dim_size = inp.size(dim)
-        min_index, max_index = torch.aminmax(index)
-        if int(min_index.item()) < -dim_size or int(max_index.item()) >= dim_size:
-            raise IndexError("index out of range in self")
     return dim, index.contiguous()
 
 

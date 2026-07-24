@@ -739,6 +739,10 @@ raise SystemExit(1)
 """
     env = os.environ.copy()
     env.pop("FLAG_GEMS_INDEX_FILL_BOUNDS_CHECK", None)
+    # HCU's HIP device assert is not surfaced consistently to the host.
+    # Exercise the same strict IndexError contract through the explicit mode.
+    if flag_gems.vendor_name == "hygon":
+        env["FLAG_GEMS_INDEX_FILL_BOUNDS_CHECK"] = "sync"
     if execution_path != "cpp":
         env["FLAG_GEMS_INDEX_FILL_CPP_LAUNCHER"] = "0"
 
