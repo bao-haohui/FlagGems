@@ -22,7 +22,7 @@ INDEX_FILL_DTYPES = [
         dtype,
         marks=pytest.mark.skipif(
             flag_gems.device == "npu" and dtype == torch.int16,
-            reason="torch_npu/ACLNN does not support int16 index_fill reference",
+            reason="torch_npu does not support int16 index_fill reference",
         ),
     )
     for dtype in _INDEX_FILL_DTYPES
