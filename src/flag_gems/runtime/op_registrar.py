@@ -24,9 +24,9 @@ class GeneralOpRegistrar:
         self.reg_key = self.device.dispatch_key
         self.all_ops = []
         self.all_keys = []
-        if self.device.vendor in (common.vendors.CAMBRICON, common.vendors.HYGON):
-            # Preserve native kernels for backends that selectively fall back to
-            # a vendor library implementation after overriding an ATen op.
+        if self.device.vendor == common.vendors.CAMBRICON:
+            # TODO: Cambricon specific, to avoid op deadlock question in libtuner.
+            # Should remove this in the future.
             self.torch_ops_map = {}
 
         # optional mapping func_name -> list of config entries
@@ -117,7 +117,7 @@ class GeneralOpRegistrar:
         device_key = self.reg_key
         self.all_ops.append(fn.__name__)
         self.all_keys.append(key)
-        if self.device.vendor in (common.vendors.CAMBRICON, common.vendors.HYGON):
+        if self.device.vendor == common.vendors.CAMBRICON:
             import torch
 
             try:
@@ -126,7 +126,6 @@ class GeneralOpRegistrar:
                 )
             except Exception:
                 pass
-        if self.device.vendor == common.vendors.CAMBRICON:
             try:
                 self.lib.impl(key, fn, device_key, allow_override=True)
             except TypeError:
