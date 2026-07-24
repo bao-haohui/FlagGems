@@ -2,6 +2,7 @@ import importlib.util
 import logging
 import math
 import os
+import weakref
 from typing import Any, Callable, Mapping, Tuple
 
 import numpy as np
@@ -789,13 +790,148 @@ _strided_index_fill = _AscendStridedIndexFillFunction()
 
 
 _ASCEND_INDEX_HOST_CHECK_MAX_BYTES = 32 * 1024
+_ASCEND_INDEX_VALIDATION_CACHE_MAX_ENTRIES = 256
+_ASCEND_MEMBERSHIP_CACHE_MAX_ENTRIES = 64
+_ASCEND_MEMBERSHIP_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_ascend_membership_cache = {}
+_ascend_membership_cache_bytes = 0
+_ascend_index_validation_cache = {}
 
 
 def _should_use_ascend_host_index_check(index):
     return index.numel() * index.element_size() <= _ASCEND_INDEX_HOST_CHECK_MAX_BYTES
 
 
+def _get_ascend_index_version(index):
+    try:
+        return index._version
+    except RuntimeError:
+        # Inference tensors do not expose a version counter, so they cannot
+        # safely participate in a mutation-sensitive validation cache.
+        return None
+
+
+def _get_cached_ascend_index_bounds(index, dim_size):
+    cache_key = id(index)
+    entry = _ascend_index_validation_cache.get(cache_key)
+    if entry is None:
+        return None
+
+    index_ref, version, cached_dim_size, has_negative, host_index = entry
+    if (
+        index_ref() is index
+        and version == _get_ascend_index_version(index)
+        and cached_dim_size == dim_size
+    ):
+        return has_negative, host_index
+
+    _ascend_index_validation_cache.pop(cache_key, None)
+    return None
+
+
+def _cache_ascend_index_bounds(index, dim_size, has_negative, host_index):
+    version = _get_ascend_index_version(index)
+    if version is None:
+        return
+
+    cache_key = id(index)
+
+    def _remove_entry(index_ref):
+        entry = _ascend_index_validation_cache.get(cache_key)
+        if entry is not None and entry[0] is index_ref:
+            _ascend_index_validation_cache.pop(cache_key, None)
+
+    try:
+        index_ref = weakref.ref(index, _remove_entry)
+    except TypeError:
+        return
+
+    _ascend_index_validation_cache[cache_key] = (
+        index_ref,
+        version,
+        dim_size,
+        has_negative,
+        host_index,
+    )
+    while (
+        len(_ascend_index_validation_cache)
+        > _ASCEND_INDEX_VALIDATION_CACHE_MAX_ENTRIES
+    ):
+        _ascend_index_validation_cache.pop(next(iter(_ascend_index_validation_cache)))
+
+
+def _pop_cached_ascend_membership_mask(cache_key):
+    global _ascend_membership_cache_bytes
+
+    entry = _ascend_membership_cache.pop(cache_key, None)
+    if entry is not None:
+        _ascend_membership_cache_bytes -= entry[-1]
+    return entry
+
+
+def _get_cached_ascend_membership_mask(index, dim_size, device):
+    cache_key = (id(index), device)
+    entry = _ascend_membership_cache.get(cache_key)
+    if entry is None:
+        return None
+
+    index_ref, version, cached_dim_size, membership, _ = entry
+    if (
+        index_ref() is index
+        and version == _get_ascend_index_version(index)
+        and cached_dim_size == dim_size
+    ):
+        _ascend_membership_cache.pop(cache_key)
+        _ascend_membership_cache[cache_key] = entry
+        return membership
+
+    _pop_cached_ascend_membership_mask(cache_key)
+    return None
+
+
+def _cache_ascend_membership_mask(index, dim_size, membership):
+    global _ascend_membership_cache_bytes
+
+    version = _get_ascend_index_version(index)
+    membership_bytes = membership.numel() * membership.element_size()
+    if version is None or membership_bytes > _ASCEND_MEMBERSHIP_CACHE_MAX_BYTES:
+        return
+
+    cache_key = (id(index), str(membership.device))
+
+    def _remove_entry(index_ref):
+        entry = _ascend_membership_cache.get(cache_key)
+        if entry is not None and entry[0] is index_ref:
+            _pop_cached_ascend_membership_mask(cache_key)
+
+    try:
+        index_ref = weakref.ref(index, _remove_entry)
+    except TypeError:
+        return
+
+    _pop_cached_ascend_membership_mask(cache_key)
+    while _ascend_membership_cache and (
+        len(_ascend_membership_cache) >= _ASCEND_MEMBERSHIP_CACHE_MAX_ENTRIES
+        or _ascend_membership_cache_bytes + membership_bytes
+        > _ASCEND_MEMBERSHIP_CACHE_MAX_BYTES
+    ):
+        _pop_cached_ascend_membership_mask(next(iter(_ascend_membership_cache)))
+
+    _ascend_membership_cache[cache_key] = (
+        index_ref,
+        version,
+        dim_size,
+        membership,
+        membership_bytes,
+    )
+    _ascend_membership_cache_bytes += membership_bytes
+
+
 def _check_ascend_index_bounds(index, dim_size):
+    cached = _get_cached_ascend_index_bounds(index, dim_size)
+    if cached is not None:
+        return cached
+
     host_index = None
     if _should_use_ascend_host_index_check(index):
         # A single small D2H copy avoids a device reduction and two scalar transfers.
@@ -807,7 +943,9 @@ def _check_ascend_index_bounds(index, dim_size):
     max_index = int(max_index.item())
     if min_index < -dim_size or max_index >= dim_size:
         raise IndexError("index out of range in self")
-    return min_index < 0, host_index
+    result = min_index < 0, host_index
+    _cache_ascend_index_bounds(index, dim_size, *result)
+    return result
 
 
 def _prepare_ascend_index(inp, dim, index):
@@ -1001,6 +1139,10 @@ def _can_use_contiguous_membership_mask(out, dim, index, bounds_checked):
 
 
 def _build_contiguous_membership_mask(out, index, has_negative, dim_size):
+    cached = _get_cached_ascend_membership_mask(index, dim_size, str(out.device))
+    if cached is not None:
+        return cached
+
     index_len = index.numel()
     block_i = 256
     marker_grid = (min(triton.cdiv(index_len, block_i), 128),)
@@ -1034,6 +1176,7 @@ def _build_contiguous_membership_mask(out, index, has_negative, dim_size):
                 USE_INT32=use_int32,
                 BLOCK_I=block_i,
             )
+    _cache_ascend_membership_mask(index, dim_size, membership)
     return membership
 
 

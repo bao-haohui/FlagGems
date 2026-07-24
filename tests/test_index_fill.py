@@ -99,6 +99,78 @@ def test_index_fill_ascend_host_bounds_check_threshold(
 @pytest.mark.index_fill
 @pytest.mark.skipif(
     flag_gems.device != "npu",
+    reason="Ascend bounds-check cache is only used on NPU",
+)
+def test_index_fill_ascend_bounds_check_cache_revalidates_mutated_index(monkeypatch):
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    inp = torch.empty((4, 8), dtype=torch.float16, device=flag_gems.device)
+    index = torch.tensor([0, -1], dtype=torch.long, device=flag_gems.device)
+    original_aminmax = ascend_index_fill.torch.aminmax
+    calls = 0
+
+    def counted_aminmax(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_aminmax(*args, **kwargs)
+
+    ascend_index_fill._ascend_index_validation_cache.clear()
+    monkeypatch.setattr(ascend_index_fill.torch, "aminmax", counted_aminmax)
+
+    dim, prepared, bounds_checked, has_negative, _ = (
+        ascend_index_fill._prepare_ascend_index(inp, 0, index)
+    )
+    assert (dim, prepared is index, bounds_checked, has_negative) == (
+        0,
+        True,
+        True,
+        True,
+    )
+    ascend_index_fill._prepare_ascend_index(inp, 0, index)
+    assert calls == 1
+
+    index.copy_(torch.tensor([0, 4], dtype=torch.long, device=flag_gems.device))
+    with pytest.raises(IndexError, match="index out of range in self"):
+        ascend_index_fill._prepare_ascend_index(inp, 0, index)
+    assert calls == 2
+    ascend_index_fill._ascend_index_validation_cache.clear()
+
+
+@pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
+    reason="Ascend membership cache is only used on NPU",
+)
+def test_index_fill_ascend_membership_cache_revalidates_mutated_index():
+    from flag_gems.runtime.backend._ascend.ops import index_fill as ascend_index_fill
+
+    out = torch.empty((1024, 4096), dtype=torch.float16, device=flag_gems.device)
+    index = torch.tensor([0, 2, 7], dtype=torch.long, device=flag_gems.device)
+
+    ascend_index_fill._ascend_membership_cache.clear()
+    ascend_index_fill._ascend_membership_cache_bytes = 0
+    first = ascend_index_fill._build_contiguous_membership_mask(
+        out, index, has_negative=False, dim_size=4096
+    )
+    second = ascend_index_fill._build_contiguous_membership_mask(
+        out, index, has_negative=False, dim_size=4096
+    )
+    assert second is first
+
+    index.copy_(torch.tensor([1, 3, 9], dtype=torch.long, device=flag_gems.device))
+    third = ascend_index_fill._build_contiguous_membership_mask(
+        out, index, has_negative=False, dim_size=4096
+    )
+    assert third is not first
+    expected = torch.tensor([0, 1, 0, 1, 0, 0, 0, 0, 0, 1])
+    assert torch.equal(third.cpu()[:10], expected)
+    ascend_index_fill._ascend_membership_cache.clear()
+    ascend_index_fill._ascend_membership_cache_bytes = 0
+
+
+@pytest.mark.index_fill
+@pytest.mark.skipif(
+    flag_gems.device != "npu",
     reason="Ascend transpose-fill dispatch is only used on NPU",
 )
 @pytest.mark.parametrize(
