@@ -37,7 +37,7 @@ INDEX_FILL_OPS = [
 ]
 INDEX_FILL_OOB_PATHS = (
     ("cpp", "python_contiguous", "python_strided")
-    if flag_gems.device == "cuda"
+    if flag_gems.vendor_name == "nvidia"
     else ("python_contiguous", "python_strided")
 )
 
