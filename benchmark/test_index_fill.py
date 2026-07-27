@@ -1,5 +1,4 @@
 import math
-import os
 
 import pytest
 import torch
@@ -126,26 +125,8 @@ def index_fill_input_fn(shape, dtype, device):
         yield inp, dim, index, _scalar_value(dtype)
 
 
-_ASCEND_TORCH_BASELINE_ENV = "FLAGGEMS_ALLOW_ASCEND_TORCH_INDEX_FILL_BASELINE"
-
-
-def _skip_unrepresentative_ascend_torch_baseline():
-    if (
-        base.vendor_name == "ascend"
-        and base.device == "npu"
-        and os.environ.get(_ASCEND_TORCH_BASELINE_ENV) != "1"
-    ):
-        pytest.skip(
-            "Ascend Torch Eager index_fill baseline requires an explicit profiler "
-            f"validation; set {_ASCEND_TORCH_BASELINE_ENV}=1 only after confirming "
-            "aclnnIndexFill/aclnnInplaceIndexFill without aten::item. Otherwise use "
-            "test_index_fill_npu_reference.py for the direct ACLNN comparison."
-        )
-
-
 @pytest.mark.index_fill
 def test_index_fill():
-    _skip_unrepresentative_ascend_torch_baseline()
     bench = IndexFillBenchmark(
         op_name="index_fill",
         input_fn=index_fill_input_fn,
@@ -158,7 +139,6 @@ def test_index_fill():
 
 @pytest.mark.index_fill_
 def test_index_fill_():
-    _skip_unrepresentative_ascend_torch_baseline()
     bench = IndexFillBenchmark(
         op_name="index_fill_",
         input_fn=index_fill_input_fn,
